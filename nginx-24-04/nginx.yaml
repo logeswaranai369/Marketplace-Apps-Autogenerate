@@ -1,0 +1,82 @@
+- name: nginx Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Updating Packages
+        ansible.builtin.apt:
+          update_cache: yes
+
+      # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+      - name: Install nginx web server
+        apt:
+          name: nginx
+          state: latest
+          update_cache: yes
+
+      - name: Debug - nginx package installed
+        debug:
+          msg: "nginx installed from the default apt repositories."
+
+      - name: Ensure nginx service is enabled and started
+        service:
+          name: nginx
+          state: started
+          enabled: yes
+
+      - name: Debug - nginx service running
+        debug:
+          msg: "nginx service enabled and started."
+
+      - name: Allow HTTP (port 80) through UFW if firewall is present
+        ufw:
+          rule: allow
+          port: "80"
+          proto: tcp
+        ignore_errors: yes
+
+      - name: Wait for nginx to listen on port 80
+        wait_for:
+          host: 127.0.0.1
+          port: 80
+          delay: 2
+          timeout: 30
+
+      - name: Verify default nginx welcome page returns HTTP 200
+        uri:
+          url: http://localhost/
+          status_code: 200
+        register: nginx_http_check
+        retries: 5
+        delay: 3
+        until: nginx_http_check.status == 200
+
+      - name: Debug - nginx health check passed
+        debug:
+          msg: "nginx is listening on port 80 and serving the default welcome page (HTTP 200)."
+      # ----- END app-specific tasks -----
+
+
+
+      - name: Creating /opt/cloudstack directory
+        ansible.builtin.file:
+          path: /opt/cloudstack
+          state: directory
+
+      - name: Copy cleanup + update helper scripts
+        copy:
+          src: "{{ item.confsrc }}"
+          dest: "{{ item.confdest }}"
+        with_items:
+          - { confsrc: '/usr/local/src/nginx-24-04/opt/cloudstack/nginx_cleanup.sh', confdest: '/opt/cloudstack/'}
+          - { confsrc: '/usr/local/src/nginx-24-04/opt/cloudstack/nginx_update.sh', confdest: '/opt/cloudstack/'}
+
+      - name: Wire cleanup script to run on first login
+        lineinfile:
+          path: /root/.bashrc
+          line: "chmod +x /opt/cloudstack/nginx_cleanup.sh && /opt/cloudstack/nginx_cleanup.sh"
+          state: present
+
+      - name: Restarting sshd
+        shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
