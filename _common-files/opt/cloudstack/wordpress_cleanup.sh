@@ -18,6 +18,9 @@ echo
 echo -e "${RED}Credential: wordpress_db_password (stored at /root/.wordpress_db_password)${NC}"
 cat /root/.wordpress_db_password
 echo
+echo -e "${RED}Credential: wordpress_admin_password (stored at /root/.wordpress_admin_password)${NC}"
+cat /root/.wordpress_admin_password
+echo
 
 #Cleanup script
 rm -rf /usr/local/src/

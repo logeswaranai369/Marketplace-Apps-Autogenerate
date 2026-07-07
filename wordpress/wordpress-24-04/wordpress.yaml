@@ -28,6 +28,15 @@
               dest: "/root/.wordpress_db_password"
               content: |
                 wordpress_db_password = "{{ wordpress_db_password.stdout }}"
+          - name: Generating wordpress_admin_password
+            shell: openssl rand -hex 24
+            register: wordpress_admin_password
+
+          - name: Storing wordpress_admin_password
+            copy:
+              dest: "/root/.wordpress_admin_password"
+              content: |
+                wordpress_admin_password = "{{ wordpress_admin_password.stdout }}"
 
           - name: Copy staged config files
             copy:
@@ -37,9 +46,9 @@
               - { confsrc: '/usr/local/src/wordpress-24-04/etc/apache2/sites-available/wordpress.conf', confdest: '/etc/apache2/sites-available/'}
 
           # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
-          - name: WordPress install - installing LAMP stack and PHP extensions
+          - name: Install Apache, MariaDB, PHP and required extensions
             debug:
-              msg: "Installing Apache, MariaDB, PHP and required extensions"
+              msg: "Installing LAMP stack and PHP extensions for WordPress"
 
           - name: Install LAMP stack and required PHP extensions
             package:
@@ -47,19 +56,18 @@
                 - apache2
                 - mariadb-server
                 - php
-                - libapache2-mod-php
                 - php-mysql
+                - libapache2-mod-php
                 - php-curl
                 - php-gd
-                - php-mbstring
                 - php-xml
-                - php-xmlrpc
-                - php-soap
-                - php-intl
+                - php-mbstring
                 - php-zip
-                - python3-pymysql
+                - php-imagick
+                - php-intl
                 - wget
                 - tar
+                - python3-pymysql
               state: latest
 
           - name: Ensure Apache and MariaDB are enabled and running
@@ -71,23 +79,18 @@
               - apache2
               - mariadb
 
-          - name: WordPress install - securing MariaDB and creating database
+          - name: Secure the MariaDB database
             debug:
-              msg: "Securing MariaDB root account and provisioning the wordpress database/user"
+              msg: "Securing MariaDB root account and creating WordPress database"
 
           - name: Secure MariaDB root account with generated password
             community.mysql.mysql_user:
               login_unix_socket: /var/run/mysqld/mysqld.sock
               name: root
-              host: "{{ item }}"
+              host: localhost
               password: "{{ mysql_root_password.stdout }}"
               check_implicit_admin: yes
               state: present
-            loop:
-              - localhost
-              - 127.0.0.1
-              - "::1"
-            ignore_errors: yes
 
           - name: Create WordPress database
             community.mysql.mysql_db:
@@ -108,11 +111,11 @@
               priv: "wordpress.*:ALL"
               state: present
 
-          - name: WordPress install - downloading and extracting core
+          - name: Deploy WordPress files
             debug:
-              msg: "Downloading WordPress core from wordpress.org and extracting to /var/www/html/wordpress"
+              msg: "Downloading and extracting WordPress to /var/www/html/wordpress"
 
-          - name: Ensure WordPress directory exists
+          - name: Ensure WordPress web root exists
             file:
               path: /var/www/html/wordpress
               state: directory
@@ -142,10 +145,6 @@
               group: www-data
             when: not wp_installed.stat.exists
 
-          - name: WordPress install - generating wp-config.php with real secrets
-            debug:
-              msg: "Creating wp-config.php from sample and injecting DB credentials and fresh salts"
-
           - name: Create wp-config.php from sample
             copy:
               src: /var/www/html/wordpress/wp-config-sample.php
@@ -156,63 +155,79 @@
               mode: '0640'
               force: no
 
-          - name: Set DB name in wp-config.php
+          - name: Set DB name in wp-config
             replace:
               path: /var/www/html/wordpress/wp-config.php
               regexp: "define\\(\\s*'DB_NAME',\\s*'[^']*'\\s*\\);"
               replace: "define( 'DB_NAME', 'wordpress' );"
 
-          - name: Set DB user in wp-config.php
+          - name: Set DB user in wp-config
             replace:
               path: /var/www/html/wordpress/wp-config.php
               regexp: "define\\(\\s*'DB_USER',\\s*'[^']*'\\s*\\);"
               replace: "define( 'DB_USER', 'wordpress' );"
 
-          - name: Set DB password in wp-config.php (real value, never a placeholder)
+          - name: Set DB password in wp-config (real value, never a placeholder)
             replace:
               path: /var/www/html/wordpress/wp-config.php
               regexp: "define\\(\\s*'DB_PASSWORD',\\s*'[^']*'\\s*\\);"
               replace: "define( 'DB_PASSWORD', '{{ wordpress_db_password.stdout }}' );"
 
-          - name: Check if salts have already been injected
-            command: grep -q "put your unique phrase here" /var/www/html/wordpress/wp-config.php
-            register: wp_salts_default
-            failed_when: false
-            changed_when: false
+          - name: Set DB host in wp-config
+            replace:
+              path: /var/www/html/wordpress/wp-config.php
+              regexp: "define\\(\\s*'DB_HOST',\\s*'[^']*'\\s*\\);"
+              replace: "define( 'DB_HOST', 'localhost' );"
 
-          - name: Fetch fresh WordPress salts from api.wordpress.org
+          - name: Fetch fresh WordPress salts
             get_url:
               url: https://api.wordpress.org/secret-key/1.1/salt/
-              dest: /tmp/wp-salts.txt
+              dest: /tmp/wp-salts.php
               mode: '0644'
-            when: wp_salts_default.rc == 0
-
-          - name: Remove default salt definitions from wp-config.php
-            lineinfile:
-              path: /var/www/html/wordpress/wp-config.php
-              state: absent
-              regexp: "^define\\(\\s*'(AUTH_KEY|SECURE_AUTH_KEY|LOGGED_IN_KEY|NONCE_KEY|AUTH_SALT|SECURE_AUTH_SALT|LOGGED_IN_SALT|NONCE_SALT)'"
-            when: wp_salts_default.rc == 0
+            failed_when: false
+            register: wp_salts_fetch
 
           - name: Read fetched salts
             slurp:
-              src: /tmp/wp-salts.txt
+              src: /tmp/wp-salts.php
             register: wp_salts_content
-            when: wp_salts_default.rc == 0
+            when: wp_salts_fetch is defined and wp_salts_fetch.status_code | default(0) == 200
 
-          - name: Insert fresh salts into wp-config.php
+          - name: Replace placeholder salts in wp-config
             blockinfile:
               path: /var/www/html/wordpress/wp-config.php
-              marker: "// {mark} WORDPRESS SALTS"
-              insertbefore: "^\\$table_prefix"
+              marker: "// {mark} MARKGEN SALTS"
+              insertbefore: "/\\* That's all, stop editing"
               block: "{{ wp_salts_content.content | b64decode }}"
-            when: wp_salts_default.rc == 0
+            when: wp_salts_content.content is defined
 
-          - name: WordPress install - configuring Apache virtual host
+          # The public URL of a marketplace VM is NOT known at install time (CloudStack NAT).
+          # Make WordPress URL-agnostic: derive the site URL from the request Host header.
+          - name: Make WordPress URL-agnostic (serve on whatever host the browser used)
+            blockinfile:
+              path: /var/www/html/wordpress/wp-config.php
+              marker: "// {mark} MARKGEN DYNAMIC SITE URL"
+              insertbefore: "/\\* That's all, stop editing"
+              block: |
+                if ( isset( $_SERVER['HTTP_HOST'] ) ) {
+                    $markgen_scheme = ( ! empty( $_SERVER['HTTPS'] ) && $_SERVER['HTTPS'] !== 'off' ) ? 'https' : 'http';
+                    define( 'WP_HOME', $markgen_scheme . '://' . $_SERVER['HTTP_HOST'] );
+                    define( 'WP_SITEURL', $markgen_scheme . '://' . $_SERVER['HTTP_HOST'] );
+                }
+
+          - name: Ensure WordPress files are owned by www-data
+            file:
+              path: /var/www/html/wordpress
+              state: directory
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Configure Apache virtual host
             debug:
-              msg: "Deploying the WordPress vhost, enabling rewrite and reloading Apache"
+              msg: "Deploying Apache vhost and enabling rewrite module"
 
-          - name: Deploy Apache virtual host
+          - name: Deploy Apache virtual host (DocumentRoot MUST match the extract path)
             copy:
               dest: /etc/apache2/sites-available/wordpress.conf
               content: |
@@ -231,7 +246,7 @@
                 </VirtualHost>
               mode: '0644'
 
-          - name: Enable WordPress site, rewrite module and disable default site
+          - name: Enable site and rewrite module, disable default site
             command: "{{ item }}"
             loop:
               - a2ensite wordpress
@@ -244,9 +259,9 @@
               name: apache2
               state: reloaded
 
-          - name: WordPress install - completing first-run setup with WP-CLI
+          - name: Complete WordPress first-run setup
             debug:
-              msg: "Running wp core install so the site actually serves a working page"
+              msg: "Installing WP-CLI and completing WordPress core install"
 
           - name: Download WP-CLI
             get_url:
@@ -260,66 +275,44 @@
             failed_when: false
             changed_when: false
 
-          - name: Generate a WordPress admin password
-            command: openssl rand -base64 16
-            register: wp_admin_password
-            when: wp_core_installed.rc != 0
-
-          - name: Complete first-run setup so the app actually SERVES (health check needs 2xx)
+          # --url is only a bootstrap seed; the dynamic WP_HOME/WP_SITEURL in wp-config overrides
+          # it per-request so the site serves on the real browsed host.
+          - name: Complete first-run setup so WordPress actually SERVES (health check needs 2xx)
             command: >
               wp core install
               --path=/var/www/html/wordpress
               --url=http://localhost/
               --title="WordPress Site"
               --admin_user=admin
-              --admin_password='{{ wp_admin_password.stdout }}'
+              --admin_password='{{ wordpress_admin_password.stdout }}'
               --admin_email=admin@localhost.local
               --skip-email
               --allow-root
             when: wp_core_installed.rc != 0
 
-          - name: WordPress install - writing credentials file and MOTD notice
+          - name: Write consolidated credentials file for operator
             debug:
-              msg: "Storing credentials in /home/ubuntu/credentials.txt and configuring login MOTD"
+              msg: "Writing consolidated credentials to /home/ubuntu/credentials.txt"
 
-          - name: Ensure /home/ubuntu exists
-            file:
-              path: /home/ubuntu
-              state: directory
-              owner: ubuntu
-              group: ubuntu
-              mode: '0755'
-            ignore_errors: yes
-
-          - name: Write credentials file (only when a fresh admin password was generated)
+          - name: Create consolidated credentials file
             copy:
               dest: /home/ubuntu/credentials.txt
               owner: ubuntu
               group: ubuntu
               mode: '0600'
               content: |
-                ===== WordPress Application Credentials =====
-                Site URL          : http://localhost/
-                WP Admin Login URL: http://localhost/wp-login.php
-                WP Admin User     : admin
-                WP Admin Password : {{ wp_admin_password.stdout }}
+                WordPress Site Credentials
+                Site Admin URL : http://<server-ip>/wp-login.php
+                Admin User     : admin
+                Admin Password : {{ wordpress_admin_password.stdout }}
+                Admin Email    : admin@localhost.local
 
-                Database Name     : wordpress
-                Database User     : wordpress
-                Database Password : {{ wordpress_db_password.stdout }}
-                MySQL Root Password: {{ mysql_root_password.stdout }}
-            when: wp_core_installed.rc != 0
-
-          - name: Add MOTD notice pointing to the credentials file
-            copy:
-              dest: /etc/update-motd.d/99-wordpress-credentials
-              mode: '0755'
-              content: |
-                #!/bin/sh
-                echo ""
-                echo "WordPress has been installed on this server."
-                echo "Application credentials are stored at: /home/ubuntu/credentials.txt"
-                echo ""
+                Database Credentials
+                DB Name        : wordpress
+                DB User        : wordpress
+                DB Password    : {{ wordpress_db_password.stdout }}
+                DB Host        : localhost
+                MySQL Root PW  : {{ mysql_root_password.stdout }}
           # ----- END app-specific tasks -----
 
           - name: Creating /opt/cloudstack directory
