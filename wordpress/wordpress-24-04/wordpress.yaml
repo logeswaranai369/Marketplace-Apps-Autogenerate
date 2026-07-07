@@ -4,330 +4,342 @@
       - name: Restarting sshd
         shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
 
-      - name: Updating Packages
-        ansible.builtin.apt:
-          update_cache: yes
-
-      - name: Generating mysql_root_password
-        shell: openssl rand -hex 24
-        register: mysql_root_password
-
-      - name: Storing mysql_root_password
-        copy:
-          dest: "/root/.mysql_root_password"
-          content: |
-            mysql_root_password = "{{ mysql_root_password.stdout }}"
-      - name: Generating wordpress_db_password
-        shell: openssl rand -hex 24
-        register: wordpress_db_password
-
-      - name: Storing wordpress_db_password
-        copy:
-          dest: "/root/.wordpress_db_password"
-          content: |
-            wordpress_db_password = "{{ wordpress_db_password.stdout }}"
-      - name: Generating wordpress_admin_password
-        shell: openssl rand -hex 24
-        register: wordpress_admin_password
-
-      - name: Storing wordpress_admin_password
-        copy:
-          dest: "/root/.wordpress_admin_password"
-          content: |
-            wordpress_admin_password = "{{ wordpress_admin_password.stdout }}"
-
-      - name: Copy staged config files
-        copy:
-          src: "{{ item.confsrc }}"
-          dest: "{{ item.confdest }}"
-        with_items:
-          - { confsrc: '/usr/local/src/wordpress-24-04/etc/apache2/sites-available/wordpress.conf', confdest: '/etc/apache2/sites-available/'}
-
-      # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
-      - name: Install LAMP stack and required PHP extensions for WordPress
-        package:
-          name:
-            - apache2
-            - mariadb-server
-            - php
-            - libapache2-mod-php
-            - php-mysql
-            - php-curl
-            - php-gd
-            - php-mbstring
-            - php-xml
-            - php-xmlrpc
-            - php-soap
-            - php-intl
-            - php-zip
-            - wget
-            - tar
-            - python3-pymysql
-          state: latest
-
-      - name: Ensure Apache and MariaDB are enabled and running
-        service:
-          name: "{{ item }}"
-          state: started
-          enabled: yes
-        loop:
-          - apache2
-          - mariadb
-
-      - name: Secure MariaDB root account with generated password
-        community.mysql.mysql_user:
-          login_unix_socket: /var/run/mysqld/mysqld.sock
-          name: root
-          host: "{{ item }}"
-          password: "{{ mysql_root_password.stdout }}"
-          check_implicit_admin: yes
-          state: present
-        loop:
-          - localhost
-          - 127.0.0.1
-          - "::1"
-        ignore_errors: yes
-
-      - name: Debug - creating WordPress database and user
-        debug:
-          msg: "Creating WordPress database and application user"
-
-      - name: Create WordPress database
-        community.mysql.mysql_db:
-          login_user: root
-          login_password: "{{ mysql_root_password.stdout }}"
-          login_unix_socket: /var/run/mysqld/mysqld.sock
-          name: wordpress
-          state: present
-
-      - name: Create WordPress database user
-        community.mysql.mysql_user:
-          login_user: root
-          login_password: "{{ mysql_root_password.stdout }}"
-          login_unix_socket: /var/run/mysqld/mysqld.sock
-          name: wordpress
-          password: "{{ wordpress_db_password.stdout }}"
-          host: localhost
-          priv: "wordpress.*:ALL"
-          state: present
-
-      - name: Debug - downloading WordPress core
-        debug:
-          msg: "Downloading latest WordPress core tarball"
-
-      - name: Download latest WordPress tarball
-        get_url:
-          url: https://wordpress.org/latest.tar.gz
-          dest: /tmp/wordpress-latest.tar.gz
-          mode: '0644'
-
-      - name: Ensure WordPress web root exists
-        file:
-          path: /var/www/wordpress
-          state: directory
-          owner: www-data
-          group: www-data
-          mode: '0755'
-
-      - name: Check if WordPress is already extracted
-        stat:
-          path: /var/www/wordpress/wp-settings.php
-        register: wp_installed
-
-      - name: Extract WordPress core to web root
-        unarchive:
-          src: /tmp/wordpress-latest.tar.gz
-          dest: /var/www/wordpress
-          remote_src: yes
-          extra_opts:
-            - --strip-components=1
-          owner: www-data
-          group: www-data
-        when: not wp_installed.stat.exists
-
-      - name: Ensure correct ownership of WordPress files
-        file:
-          path: /var/www/wordpress
-          state: directory
-          owner: www-data
-          group: www-data
-          recurse: yes
-
-      - name: Debug - generating wp-config.php
-        debug:
-          msg: "Generating wp-config.php with DB credentials and fresh salts"
-
-      - name: Fetch fresh WordPress salts from API
-        uri:
-          url: https://api.wordpress.org/secret-key/1.1/salt/
-          return_content: yes
-        register: wp_salts
-        ignore_errors: yes
-
-      - name: Create wp-config.php from sample
-        copy:
-          src: /var/www/wordpress/wp-config-sample.php
-          dest: /var/www/wordpress/wp-config.php
-          remote_src: yes
-          owner: www-data
-          group: www-data
-          mode: '0640'
-          force: no
-
-      - name: Set database name in wp-config.php
-        replace:
-          path: /var/www/wordpress/wp-config.php
-          regexp: "define\\(\\s*'DB_NAME',\\s*'[^']*'\\s*\\);"
-          replace: "define( 'DB_NAME', 'wordpress' );"
-
-      - name: Set database user in wp-config.php
-        replace:
-          path: /var/www/wordpress/wp-config.php
-          regexp: "define\\(\\s*'DB_USER',\\s*'[^']*'\\s*\\);"
-          replace: "define( 'DB_USER', 'wordpress' );"
-
-      - name: Set database password in wp-config.php
-        replace:
-          path: /var/www/wordpress/wp-config.php
-          regexp: "define\\(\\s*'DB_PASSWORD',\\s*'[^']*'\\s*\\);"
-          replace: "define( 'DB_PASSWORD', '{{ wordpress_db_password.stdout }}' );"
-
-      - name: Inject fresh salts into wp-config.php
+      - name: Install and configure wordpress
         block:
-          - name: Remove default salt definitions
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+          - name: Generating wordpress_db_password
+            shell: openssl rand -hex 24
+            register: wordpress_db_password
+
+          - name: Storing wordpress_db_password
+            copy:
+              dest: "/root/.wordpress_db_password"
+              content: |
+                wordpress_db_password = "{{ wordpress_db_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/wordpress-24-04/etc/apache2/sites-available/wordpress.conf', confdest: '/etc/apache2/sites-available/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: WordPress install - installing LAMP stack and PHP extensions
+            debug:
+              msg: "Installing Apache, MariaDB, PHP and required extensions"
+
+          - name: Install LAMP stack and required PHP extensions
+            package:
+              name:
+                - apache2
+                - mariadb-server
+                - php
+                - libapache2-mod-php
+                - php-mysql
+                - php-curl
+                - php-gd
+                - php-mbstring
+                - php-xml
+                - php-xmlrpc
+                - php-soap
+                - php-intl
+                - php-zip
+                - python3-pymysql
+                - wget
+                - tar
+              state: latest
+
+          - name: Ensure Apache and MariaDB are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - apache2
+              - mariadb
+
+          - name: WordPress install - securing MariaDB and creating database
+            debug:
+              msg: "Securing MariaDB root account and provisioning the wordpress database/user"
+
+          - name: Secure MariaDB root account with generated password
+            community.mysql.mysql_user:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: root
+              host: "{{ item }}"
+              password: "{{ mysql_root_password.stdout }}"
+              check_implicit_admin: yes
+              state: present
+            loop:
+              - localhost
+              - 127.0.0.1
+              - "::1"
+            ignore_errors: yes
+
+          - name: Create WordPress database
+            community.mysql.mysql_db:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: wordpress
+              state: present
+
+          - name: Create WordPress database user
+            community.mysql.mysql_user:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: wordpress
+              password: "{{ wordpress_db_password.stdout }}"
+              host: localhost
+              priv: "wordpress.*:ALL"
+              state: present
+
+          - name: WordPress install - downloading and extracting core
+            debug:
+              msg: "Downloading WordPress core from wordpress.org and extracting to /var/www/html/wordpress"
+
+          - name: Ensure WordPress directory exists
+            file:
+              path: /var/www/html/wordpress
+              state: directory
+              owner: www-data
+              group: www-data
+              mode: '0755'
+
+          - name: Download latest WordPress tarball
+            get_url:
+              url: https://wordpress.org/latest.tar.gz
+              dest: /tmp/wordpress-latest.tar.gz
+              mode: '0644'
+
+          - name: Check if WordPress is already extracted
+            stat:
+              path: /var/www/html/wordpress/wp-settings.php
+            register: wp_installed
+
+          - name: Extract WordPress to web root
+            unarchive:
+              src: /tmp/wordpress-latest.tar.gz
+              dest: /var/www/html/wordpress
+              remote_src: yes
+              extra_opts:
+                - --strip-components=1
+              owner: www-data
+              group: www-data
+            when: not wp_installed.stat.exists
+
+          - name: WordPress install - generating wp-config.php with real secrets
+            debug:
+              msg: "Creating wp-config.php from sample and injecting DB credentials and fresh salts"
+
+          - name: Create wp-config.php from sample
+            copy:
+              src: /var/www/html/wordpress/wp-config-sample.php
+              dest: /var/www/html/wordpress/wp-config.php
+              remote_src: yes
+              owner: www-data
+              group: www-data
+              mode: '0640'
+              force: no
+
+          - name: Set DB name in wp-config.php
+            replace:
+              path: /var/www/html/wordpress/wp-config.php
+              regexp: "define\\(\\s*'DB_NAME',\\s*'[^']*'\\s*\\);"
+              replace: "define( 'DB_NAME', 'wordpress' );"
+
+          - name: Set DB user in wp-config.php
+            replace:
+              path: /var/www/html/wordpress/wp-config.php
+              regexp: "define\\(\\s*'DB_USER',\\s*'[^']*'\\s*\\);"
+              replace: "define( 'DB_USER', 'wordpress' );"
+
+          - name: Set DB password in wp-config.php (real value, never a placeholder)
+            replace:
+              path: /var/www/html/wordpress/wp-config.php
+              regexp: "define\\(\\s*'DB_PASSWORD',\\s*'[^']*'\\s*\\);"
+              replace: "define( 'DB_PASSWORD', '{{ wordpress_db_password.stdout }}' );"
+
+          - name: Check if salts have already been injected
+            command: grep -q "put your unique phrase here" /var/www/html/wordpress/wp-config.php
+            register: wp_salts_default
+            failed_when: false
+            changed_when: false
+
+          - name: Fetch fresh WordPress salts from api.wordpress.org
+            get_url:
+              url: https://api.wordpress.org/secret-key/1.1/salt/
+              dest: /tmp/wp-salts.txt
+              mode: '0644'
+            when: wp_salts_default.rc == 0
+
+          - name: Remove default salt definitions from wp-config.php
             lineinfile:
-              path: /var/www/wordpress/wp-config.php
-              regexp: "define\\(\\s*'(AUTH_KEY|SECURE_AUTH_KEY|LOGGED_IN_KEY|NONCE_KEY|AUTH_SALT|SECURE_AUTH_SALT|LOGGED_IN_SALT|NONCE_SALT)'.*"
+              path: /var/www/html/wordpress/wp-config.php
               state: absent
+              regexp: "^define\\(\\s*'(AUTH_KEY|SECURE_AUTH_KEY|LOGGED_IN_KEY|NONCE_KEY|AUTH_SALT|SECURE_AUTH_SALT|LOGGED_IN_SALT|NONCE_SALT)'"
+            when: wp_salts_default.rc == 0
 
-          - name: Insert fetched salts into wp-config.php
+          - name: Read fetched salts
+            slurp:
+              src: /tmp/wp-salts.txt
+            register: wp_salts_content
+            when: wp_salts_default.rc == 0
+
+          - name: Insert fresh salts into wp-config.php
             blockinfile:
-              path: /var/www/wordpress/wp-config.php
+              path: /var/www/html/wordpress/wp-config.php
               marker: "// {mark} WORDPRESS SALTS"
-              insertbefore: "\\$table_prefix"
-              block: "{{ wp_salts.content }}"
-        when: wp_salts is succeeded and wp_salts.content is defined
+              insertbefore: "^\\$table_prefix"
+              block: "{{ wp_salts_content.content | b64decode }}"
+            when: wp_salts_default.rc == 0
 
-      - name: Debug - configuring Apache virtual host
-        debug:
-          msg: "Configuring Apache virtual host for WordPress"
+          - name: WordPress install - configuring Apache virtual host
+            debug:
+              msg: "Deploying the WordPress vhost, enabling rewrite and reloading Apache"
 
-      - name: Deploy WordPress Apache virtual host
-        copy:
-          dest: /etc/apache2/sites-available/wordpress.conf
-          content: |
-            <VirtualHost *:80>
-                ServerName localhost
-                DocumentRoot /var/www/wordpress
+          - name: Deploy Apache virtual host
+            copy:
+              dest: /etc/apache2/sites-available/wordpress.conf
+              content: |
+                <VirtualHost *:80>
+                    ServerAdmin webmaster@localhost
+                    DocumentRoot /var/www/html/wordpress
 
-                <Directory /var/www/wordpress>
-                    Options FollowSymLinks
-                    AllowOverride All
-                    Require all granted
-                </Directory>
+                    <Directory /var/www/html/wordpress>
+                        Options FollowSymLinks
+                        AllowOverride All
+                        Require all granted
+                    </Directory>
 
-                ErrorLog ${APACHE_LOG_DIR}/wordpress_error.log
-                CustomLog ${APACHE_LOG_DIR}/wordpress_access.log combined
-            </VirtualHost>
-          owner: root
-          group: root
-          mode: '0644'
+                    ErrorLog ${APACHE_LOG_DIR}/wordpress_error.log
+                    CustomLog ${APACHE_LOG_DIR}/wordpress_access.log combined
+                </VirtualHost>
+              mode: '0644'
 
-      - name: Enable WordPress site
-        command: a2ensite wordpress
-        register: a2ensite_result
-        changed_when: "'already enabled' not in a2ensite_result.stdout"
+          - name: Enable WordPress site, rewrite module and disable default site
+            command: "{{ item }}"
+            loop:
+              - a2ensite wordpress
+              - a2enmod rewrite
+              - a2dissite 000-default
+            ignore_errors: yes
 
-      - name: Enable Apache rewrite module
-        command: a2enmod rewrite
-        register: a2enmod_result
-        changed_when: "'already enabled' not in a2enmod_result.stdout"
+          - name: Reload Apache to apply configuration
+            service:
+              name: apache2
+              state: reloaded
 
-      - name: Disable default Apache site
-        command: a2dissite 000-default
-        register: a2dissite_result
-        changed_when: "'already disabled' not in a2dissite_result.stdout"
-        ignore_errors: yes
+          - name: WordPress install - completing first-run setup with WP-CLI
+            debug:
+              msg: "Running wp core install so the site actually serves a working page"
 
-      - name: Reload Apache to apply configuration
-        service:
-          name: apache2
-          state: reloaded
+          - name: Download WP-CLI
+            get_url:
+              url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+              dest: /usr/local/bin/wp
+              mode: '0755'
 
-      - name: Debug - installing WP-CLI and completing WordPress setup
-        debug:
-          msg: "Installing WP-CLI and completing WordPress installation"
+          - name: Check if WordPress setup is already complete
+            command: wp core is-installed --path=/var/www/html/wordpress --allow-root
+            register: wp_core_installed
+            failed_when: false
+            changed_when: false
 
-      - name: Download WP-CLI
-        get_url:
-          url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-          dest: /usr/local/bin/wp
-          mode: '0755'
+          - name: Generate a WordPress admin password
+            command: openssl rand -base64 16
+            register: wp_admin_password
+            when: wp_core_installed.rc != 0
 
-      - name: Check if WordPress installation is already complete
-        command: wp core is-installed --path=/var/www/wordpress --allow-root
-        register: wp_core_installed
-        failed_when: false
-        changed_when: false
+          - name: Complete first-run setup so the app actually SERVES (health check needs 2xx)
+            command: >
+              wp core install
+              --path=/var/www/html/wordpress
+              --url=http://localhost/
+              --title="WordPress Site"
+              --admin_user=admin
+              --admin_password='{{ wp_admin_password.stdout }}'
+              --admin_email=admin@localhost.local
+              --skip-email
+              --allow-root
+            when: wp_core_installed.rc != 0
 
-      - name: Complete WordPress core installation via WP-CLI
-        command: >
-          wp core install
-          --path=/var/www/wordpress
-          --url=http://localhost/
-          --title="WordPress Site"
-          --admin_user=admin
-          --admin_password='{{ wordpress_admin_password.stdout }}'
-          --admin_email=admin@localhost.local
-          --skip-email
-          --allow-root
-        when: wp_core_installed.rc != 0
+          - name: WordPress install - writing credentials file and MOTD notice
+            debug:
+              msg: "Storing credentials in /home/ubuntu/credentials.txt and configuring login MOTD"
 
-      - name: Write credentials file for operator
-        copy:
-          dest: /home/ubuntu/credentials.txt
-          content: |
-            WordPress Admin URL: http://localhost/wp-admin/
-            WordPress Admin User: admin
-            WordPress Admin Password: {{ wordpress_admin_password.stdout }}
+          - name: Ensure /home/ubuntu exists
+            file:
+              path: /home/ubuntu
+              state: directory
+              owner: ubuntu
+              group: ubuntu
+              mode: '0755'
+            ignore_errors: yes
 
-            Database Name: wordpress
-            Database User: wordpress
-            Database Password: {{ wordpress_db_password.stdout }}
-            MySQL Root Password: {{ mysql_root_password.stdout }}
-          owner: ubuntu
-          group: ubuntu
-          mode: '0600'
+          - name: Write credentials file (only when a fresh admin password was generated)
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+              content: |
+                ===== WordPress Application Credentials =====
+                Site URL          : http://localhost/
+                WP Admin Login URL: http://localhost/wp-login.php
+                WP Admin User     : admin
+                WP Admin Password : {{ wp_admin_password.stdout }}
 
-      - name: Configure firewall rules for HTTP and HTTPS (if ufw present)
-        ufw:
-          rule: allow
-          port: "{{ item }}"
-          proto: tcp
-        loop:
-          - "80"
-          - "443"
-        ignore_errors: yes
-      # ----- END app-specific tasks -----
+                Database Name     : wordpress
+                Database User     : wordpress
+                Database Password : {{ wordpress_db_password.stdout }}
+                MySQL Root Password: {{ mysql_root_password.stdout }}
+            when: wp_core_installed.rc != 0
 
-      - name: Creating /opt/cloudstack directory
-        ansible.builtin.file:
-          path: /opt/cloudstack
-          state: directory
+          - name: Add MOTD notice pointing to the credentials file
+            copy:
+              dest: /etc/update-motd.d/99-wordpress-credentials
+              mode: '0755'
+              content: |
+                #!/bin/sh
+                echo ""
+                echo "WordPress has been installed on this server."
+                echo "Application credentials are stored at: /home/ubuntu/credentials.txt"
+                echo ""
+          # ----- END app-specific tasks -----
 
-      - name: Copy cleanup + update helper scripts
-        copy:
-          src: "{{ item.confsrc }}"
-          dest: "{{ item.confdest }}"
-        with_items:
-          - { confsrc: '/usr/local/src/wordpress-24-04/opt/cloudstack/wordpress_cleanup.sh', confdest: '/opt/cloudstack/'}
-          - { confsrc: '/usr/local/src/wordpress-24-04/opt/cloudstack/wordpress_update.sh', confdest: '/opt/cloudstack/'}
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
 
-      - name: Wire cleanup script to run on first login
-        lineinfile:
-          path: /root/.bashrc
-          line: "chmod +x /opt/cloudstack/wordpress_cleanup.sh && /opt/cloudstack/wordpress_cleanup.sh"
-          state: present
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/wordpress-24-04/opt/cloudstack/wordpress_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/wordpress-24-04/opt/cloudstack/wordpress_update.sh', confdest: '/opt/cloudstack/'}
 
-      - name: Restarting sshd
-        shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/wordpress_cleanup.sh && /opt/cloudstack/wordpress_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
