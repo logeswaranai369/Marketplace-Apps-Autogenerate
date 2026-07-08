@@ -10,15 +10,15 @@
             ansible.builtin.apt:
               update_cache: yes
 
-          - name: Generating mysql_root_password
+          - name: Generating mariadb_root_password
             shell: openssl rand -hex 24
-            register: mysql_root_password
+            register: mariadb_root_password
 
-          - name: Storing mysql_root_password
+          - name: Storing mariadb_root_password
             copy:
-              dest: "/root/.mysql_root_password"
+              dest: "/root/.mariadb_root_password"
               content: |
-                mysql_root_password = "{{ mysql_root_password.stdout }}"
+                mariadb_root_password = "{{ mariadb_root_password.stdout }}"
           - name: Generating wordpress_db_password
             shell: openssl rand -hex 24
             register: wordpress_db_password
@@ -44,13 +44,10 @@
               dest: "{{ item.confdest }}"
             with_items:
               - { confsrc: '/usr/local/src/wordpress-woocommerce-24-04/etc/apache2/sites-available/wordpress.conf', confdest: '/etc/apache2/sites-available/'}
+              - { confsrc: '/usr/local/src/wordpress-woocommerce-24-04/var/www/html/wordpress/.htaccess', confdest: '/var/www/html/wordpress/'}
 
           # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
-          - name: Install Apache, MariaDB, PHP and required extensions
-            debug:
-              msg: "Installing Apache, MariaDB, PHP and WordPress/WooCommerce dependencies"
-
-          - name: Install LAMP stack and required PHP extensions
+          - name: Install LAMP stack and required packages
             package:
               name:
                 - apache2
@@ -60,16 +57,12 @@
                 - php-mysql
                 - php-curl
                 - php-gd
-                - php-xml
                 - php-mbstring
+                - php-xml
                 - php-zip
-                - php-intl
-                - php-soap
-                - php-bcmath
-                - php-imagick
+                - python3-pymysql
                 - curl
                 - unzip
-                - python3-pymysql
               state: latest
 
           - name: Ensure Apache and MariaDB are enabled and running
@@ -81,31 +74,23 @@
               - apache2
               - mariadb
 
-          - name: Secure MariaDB and configure databases
-            debug:
-              msg: "Securing MariaDB root account and creating WordPress database"
-
-          - name: Secure MariaDB root account with generated password
-            community.mysql.mysql_user:
-              login_unix_socket: /var/run/mysqld/mysqld.sock
-              name: root
-              host: localhost
-              password: "{{ mysql_root_password.stdout }}"
-              check_implicit_admin: yes
-              state: present
+          - name: Secure MariaDB root (password + keep socket auth; no lockout)
+            shell: |
+              mysql -u root <<'SQL'
+              ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('{{ mariadb_root_password.stdout }}') OR unix_socket;
+              FLUSH PRIVILEGES;
+              SQL
+            args:
+              executable: /bin/bash
 
           - name: Create WordPress database
             community.mysql.mysql_db:
-              login_user: root
-              login_password: "{{ mysql_root_password.stdout }}"
               login_unix_socket: /var/run/mysqld/mysqld.sock
               name: wordpress
               state: present
 
           - name: Create WordPress database user
             community.mysql.mysql_user:
-              login_user: root
-              login_password: "{{ mysql_root_password.stdout }}"
               login_unix_socket: /var/run/mysqld/mysqld.sock
               name: wordpress
               password: "{{ wordpress_db_password.stdout }}"
@@ -113,17 +98,11 @@
               priv: "wordpress.*:ALL"
               state: present
 
-          - name: Download and install WordPress core
+          - name: Stage - download WordPress core
             debug:
-              msg: "Downloading WP-CLI and WordPress core into /var/www/html/wordpress"
+              msg: "Downloading WordPress core..."
 
-          - name: Download WP-CLI
-            get_url:
-              url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-              dest: /usr/local/bin/wp
-              mode: '0755'
-
-          - name: Ensure WordPress docroot exists
+          - name: Ensure WordPress install directory exists
             file:
               path: /var/www/html/wordpress
               state: directory
@@ -131,34 +110,56 @@
               group: www-data
               mode: '0755'
 
-          - name: Check if WordPress core is already downloaded
+          - name: Download latest WordPress tarball
+            get_url:
+              url: https://wordpress.org/latest.tar.gz
+              dest: /tmp/wordpress-latest.tar.gz
+              mode: '0644'
+
+          - name: Check if WordPress core is already extracted
             stat:
               path: /var/www/html/wordpress/wp-settings.php
-            register: wp_core_files
+            register: wp_installed
 
-          - name: Download WordPress core via WP-CLI
-            command: wp core download --path=/var/www/html/wordpress --allow-root
-            when: not wp_core_files.stat.exists
+          - name: Extract WordPress to web root
+            unarchive:
+              src: /tmp/wordpress-latest.tar.gz
+              dest: /var/www/html/wordpress
+              remote_src: yes
+              extra_opts:
+                - --strip-components=1
+              owner: www-data
+              group: www-data
+            when: not wp_installed.stat.exists
 
-          - name: Check if wp-config.php exists
-            stat:
+          - name: Create wp-config.php from sample
+            copy:
+              src: /var/www/html/wordpress/wp-config-sample.php
+              dest: /var/www/html/wordpress/wp-config.php
+              remote_src: yes
+              owner: www-data
+              group: www-data
+              mode: '0640'
+              force: no
+
+          - name: Set DB name in wp-config (real value)
+            replace:
               path: /var/www/html/wordpress/wp-config.php
-            register: wp_config_file
+              regexp: "define\\(\\s*'DB_NAME',\\s*'[^']*'\\s*\\);"
+              replace: "define( 'DB_NAME', 'wordpress' );"
 
-          - name: Generate wp-config.php with DB credentials
-            command: >
-              wp config create
-              --path=/var/www/html/wordpress
-              --dbname=wordpress
-              --dbuser=wordpress
-              --dbpass='{{ wordpress_db_password.stdout }}'
-              --dbhost=localhost
-              --allow-root
-            when: not wp_config_file.stat.exists
+          - name: Set DB user in wp-config (real value)
+            replace:
+              path: /var/www/html/wordpress/wp-config.php
+              regexp: "define\\(\\s*'DB_USER',\\s*'[^']*'\\s*\\);"
+              replace: "define( 'DB_USER', 'wordpress' );"
 
-          # The public URL of a marketplace VM is NOT known at install time (CloudStack NAT: the guest
-          # only sees a private IP). Make WordPress URL-agnostic: derive the site URL from the actual
-          # Host header of each request, so it serves correctly on whatever IP/hostname the user browses.
+          - name: Set DB password in wp-config (real value, never a placeholder)
+            replace:
+              path: /var/www/html/wordpress/wp-config.php
+              regexp: "define\\(\\s*'DB_PASSWORD',\\s*'[^']*'\\s*\\);"
+              replace: "define( 'DB_PASSWORD', '{{ wordpress_db_password.stdout }}' );"
+
           - name: Make WordPress URL-agnostic (serve on whatever host the browser used)
             blockinfile:
               path: /var/www/html/wordpress/wp-config.php
@@ -171,7 +172,22 @@
                     define( 'WP_SITEURL', $markgen_scheme . '://' . $_SERVER['HTTP_HOST'] );
                 }
 
-          - name: Set ownership of WordPress docroot
+          - name: Ensure fresh WordPress salts are set
+            replace:
+              path: /var/www/html/wordpress/wp-config.php
+              regexp: "define\\(\\s*'{{ item }}',\\s*'put your unique phrase here'\\s*\\);"
+              replace: "define( '{{ item }}', '{{ lookup('password', '/dev/null length=64 chars=ascii_letters,digits') }}' );"
+            loop:
+              - AUTH_KEY
+              - SECURE_AUTH_KEY
+              - LOGGED_IN_KEY
+              - NONCE_KEY
+              - AUTH_SALT
+              - SECURE_AUTH_SALT
+              - LOGGED_IN_SALT
+              - NONCE_SALT
+
+          - name: Ensure correct ownership of WordPress install dir
             file:
               path: /var/www/html/wordpress
               state: directory
@@ -179,9 +195,9 @@
               group: www-data
               recurse: yes
 
-          - name: Configure Apache virtual host
+          - name: Stage - configure Apache vhost
             debug:
-              msg: "Deploying Apache vhost with DocumentRoot /var/www/html/wordpress"
+              msg: "Deploying Apache virtual host for WordPress..."
 
           - name: Deploy Apache virtual host (DocumentRoot matches extract path)
             copy:
@@ -202,7 +218,7 @@
                 </VirtualHost>
               mode: '0644'
 
-          - name: Enable site and rewrite module, disable default site
+          - name: Enable site, rewrite module, disable default site
             command: "{{ item }}"
             loop:
               - a2ensite wordpress
@@ -215,9 +231,15 @@
               name: apache2
               state: reloaded
 
-          - name: Complete WordPress first-run setup
+          - name: Stage - complete WordPress setup with WP-CLI
             debug:
-              msg: "Running wp core install so the site actually serves"
+              msg: "Completing WordPress first-run setup and installing WooCommerce..."
+
+          - name: Download WP-CLI
+            get_url:
+              url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+              dest: /usr/local/bin/wp
+              mode: '0755'
 
           - name: Check if WordPress setup is already complete
             command: wp core is-installed --path=/var/www/html/wordpress --allow-root
@@ -225,14 +247,12 @@
             failed_when: false
             changed_when: false
 
-          # --url is only a bootstrap seed; the dynamic WP_HOME/WP_SITEURL in wp-config overrides it
-          # per-request so the site serves on the real browsed host. localhost satisfies the health check.
-          - name: Complete first-run setup so the app actually SERVES (health check needs 2xx)
+          - name: Complete first-run setup so the site actually SERVES (health check needs 2xx)
             command: >
               wp core install
               --path=/var/www/html/wordpress
               --url=http://localhost/
-              --title="WordPress Store"
+              --title="WordPress WooCommerce Store"
               --admin_user=admin
               --admin_password='{{ wordpress_admin_password.stdout }}'
               --admin_email=admin@localhost.local
@@ -240,27 +260,16 @@
               --allow-root
             when: wp_core_installed.rc != 0
 
-          - name: Install and activate WooCommerce (only after WordPress is serving)
-            debug:
-              msg: "Installing and activating the WooCommerce plugin"
-
-          - name: Check if WooCommerce is already active
-            command: wp plugin is-active woocommerce --path=/var/www/html/wordpress --allow-root
-            register: wc_active
-            failed_when: false
+          - name: Set pretty permalinks (required by WooCommerce) BEFORE plugin install
+            command: wp rewrite structure '/%postname%/' --path=/var/www/html/wordpress --allow-root
             changed_when: false
 
-          - name: Install and activate WooCommerce
+          - name: Install and activate WooCommerce plugin
             command: wp plugin install woocommerce --activate --path=/var/www/html/wordpress --allow-root
-            when: wc_active.rc != 0
+            register: woo_install
+            changed_when: "'Plugin already installed' not in woo_install.stdout"
 
-          - name: Set permalink structure for WooCommerce REST/checkout endpoints
-            command: "{{ item }}"
-            loop:
-              - wp rewrite structure '/%postname%/' --hard --path=/var/www/html/wordpress --allow-root
-              - wp rewrite flush --hard --path=/var/www/html/wordpress --allow-root
-
-          - name: Ensure final ownership of WordPress docroot
+          - name: Ensure ownership after WP-CLI operations
             file:
               path: /var/www/html/wordpress
               state: directory
@@ -268,31 +277,21 @@
               group: www-data
               recurse: yes
 
-          - name: Write credentials file
-            debug:
-              msg: "Writing installation credentials to /home/ubuntu/credentials.txt"
-
-          - name: Ensure credentials directory exists
-            file:
-              path: /home/ubuntu
-              state: directory
-              mode: '0755'
-
-          - name: Write WordPress/WooCommerce credentials
+          - name: Write credentials file for the operator
             copy:
               dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
               mode: '0600'
               content: |
-                WordPress + WooCommerce Installation Details
-                WordPress URL       : http://<server-ip>/
-                Admin login page    : http://<server-ip>/wp-login.php
-                Admin username      : admin
-                Admin password      : {{ wordpress_admin_password.stdout }}
-
-                Database name       : wordpress
-                Database user       : wordpress
-                Database password   : {{ wordpress_db_password.stdout }}
-                MySQL root password : {{ mysql_root_password.stdout }}
+                WordPress + WooCommerce Credentials
+                MariaDB root password : {{ mariadb_root_password.stdout }}
+                WordPress DB name      : wordpress
+                WordPress DB user      : wordpress
+                WordPress DB password  : {{ wordpress_db_password.stdout }}
+                WordPress admin user   : admin
+                WordPress admin pass   : {{ wordpress_admin_password.stdout }}
+                WordPress admin email  : admin@localhost.local
           # ----- END app-specific tasks -----
 
           - name: Creating /opt/cloudstack directory
