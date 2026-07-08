@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP="wordpress"
 INSTALLED_VERSION="6.7"
-UPSTREAM_SOURCE="apt:wordpress"
+UPSTREAM_SOURCE="https://wordpress.org/latest.tar.gz"
 
 echo "== ${APP} update check =="
 echo "Installed version: ${INSTALLED_VERSION}"

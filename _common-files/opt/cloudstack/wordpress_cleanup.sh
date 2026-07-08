@@ -12,8 +12,8 @@ ${NC}"
 echo
 echo -e "${RED}This message will be removed in the next login!${NC}"
 echo
-echo -e "${RED}Credential: mysql_root_password (stored at /root/.mysql_root_password)${NC}"
-cat /root/.mysql_root_password
+echo -e "${RED}Credential: mariadb_root_password (stored at /root/.mariadb_root_password)${NC}"
+cat /root/.mariadb_root_password
 echo
 echo -e "${RED}Credential: wordpress_db_password (stored at /root/.wordpress_db_password)${NC}"
 cat /root/.wordpress_db_password
