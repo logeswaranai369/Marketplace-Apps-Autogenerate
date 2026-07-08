@@ -1,0 +1,293 @@
+- name: wordpress+woocommerce Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure wordpress+woocommerce
+        block:
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+          - name: Generating wordpress_db_password
+            shell: openssl rand -hex 24
+            register: wordpress_db_password
+
+          - name: Storing wordpress_db_password
+            copy:
+              dest: "/root/.wordpress_db_password"
+              content: |
+                wordpress_db_password = "{{ wordpress_db_password.stdout }}"
+          - name: Generating wordpress_admin_password
+            shell: openssl rand -hex 24
+            register: wordpress_admin_password
+
+          - name: Storing wordpress_admin_password
+            copy:
+              dest: "/root/.wordpress_admin_password"
+              content: |
+                wordpress_admin_password = "{{ wordpress_admin_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/wordpress-woocommerce-24-04/etc/apache2/sites-available/wordpress.conf', confdest: '/etc/apache2/sites-available/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install LAMP stack and required PHP extensions for WooCommerce
+            package:
+              name:
+                - apache2
+                - mariadb-server
+                - php
+                - libapache2-mod-php
+                - php-mysql
+                - php-curl
+                - php-gd
+                - php-xml
+                - php-mbstring
+                - php-zip
+                - php-intl
+                - php-soap
+                - php-bcmath
+                - php-imagick
+                - curl
+                - unzip
+                - ghostscript
+                - python3-pymysql
+              state: latest
+
+          - name: Ensure Apache and MariaDB are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - apache2
+              - mariadb
+
+          - name: Secure MariaDB root account with generated password
+            community.mysql.mysql_user:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: root
+              host: localhost
+              password: "{{ mysql_root_password.stdout }}"
+              check_implicit_admin: yes
+              state: present
+
+          - name: Create WordPress database
+            community.mysql.mysql_db:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: wordpress
+              state: present
+
+          - name: Create WordPress database user
+            community.mysql.mysql_user:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: wordpress
+              password: "{{ wordpress_db_password.stdout }}"
+              host: localhost
+              priv: "wordpress.*:ALL"
+              state: present
+
+          - name: Install WP-CLI
+            get_url:
+              url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+              dest: /usr/local/bin/wp
+              mode: '0755'
+
+          - name: Debug - downloading WordPress core
+            debug:
+              msg: "Downloading WordPress core into /var/www/html/wordpress"
+
+          - name: Ensure WordPress web root exists
+            file:
+              path: /var/www/html/wordpress
+              state: directory
+              owner: www-data
+              group: www-data
+              mode: '0755'
+
+          - name: Check if WordPress core is already downloaded
+            stat:
+              path: /var/www/html/wordpress/wp-settings.php
+            register: wp_core_files
+
+          - name: Download WordPress core (latest stable)
+            command: wp core download --path=/var/www/html/wordpress --allow-root
+            become: yes
+            become_user: www-data
+            when: not wp_core_files.stat.exists
+
+          - name: Debug - creating wp-config.php
+            debug:
+              msg: "Generating wp-config.php with DB credentials and unique salts"
+
+          - name: Check if wp-config.php exists
+            stat:
+              path: /var/www/html/wordpress/wp-config.php
+            register: wp_config_file
+
+          - name: Create wp-config.php with DB credentials via WP-CLI
+            command: >
+              wp config create
+              --path=/var/www/html/wordpress
+              --dbname=wordpress
+              --dbuser=wordpress
+              --dbpass='{{ wordpress_db_password.stdout }}'
+              --dbhost=localhost
+              --allow-root
+            become: yes
+            become_user: www-data
+            when: not wp_config_file.stat.exists
+
+          # The public URL of a marketplace VM is NOT known at install time (CloudStack NAT: the guest
+          # only sees a private IP). Make WordPress URL-agnostic by deriving the site URL from the
+          # actual Host header of each request, so it serves correctly on any IP/hostname/domain.
+          - name: Make WordPress URL-agnostic (serve on whatever host the browser used)
+            blockinfile:
+              path: /var/www/html/wordpress/wp-config.php
+              marker: "// {mark} MARKGEN DYNAMIC SITE URL"
+              insertbefore: "/\\* That's all, stop editing"
+              block: |
+                if ( isset( $_SERVER['HTTP_HOST'] ) ) {
+                    $markgen_scheme = ( ! empty( $_SERVER['HTTPS'] ) && $_SERVER['HTTPS'] !== 'off' ) ? 'https' : 'http';
+                    define( 'WP_HOME', $markgen_scheme . '://' . $_SERVER['HTTP_HOST'] );
+                    define( 'WP_SITEURL', $markgen_scheme . '://' . $_SERVER['HTTP_HOST'] );
+                }
+
+          - name: Debug - deploying Apache virtual host
+            debug:
+              msg: "Deploying Apache vhost with DocumentRoot /var/www/html/wordpress"
+
+          - name: Deploy Apache virtual host (DocumentRoot matches extract path)
+            copy:
+              dest: /etc/apache2/sites-available/wordpress.conf
+              content: |
+                <VirtualHost *:80>
+                    ServerAdmin webmaster@localhost
+                    DocumentRoot /var/www/html/wordpress
+
+                    <Directory /var/www/html/wordpress>
+                        Options FollowSymLinks
+                        AllowOverride All
+                        Require all granted
+                    </Directory>
+
+                    ErrorLog ${APACHE_LOG_DIR}/wordpress_error.log
+                    CustomLog ${APACHE_LOG_DIR}/wordpress_access.log combined
+                </VirtualHost>
+              mode: '0644'
+
+          - name: Enable WordPress site, rewrite module and disable default site
+            command: "{{ item }}"
+            loop:
+              - a2enmod rewrite
+              - a2ensite wordpress
+              - a2dissite 000-default
+            ignore_errors: yes
+
+          - name: Reload Apache to apply configuration
+            service:
+              name: apache2
+              state: reloaded
+
+          - name: Debug - running WordPress first-run setup
+            debug:
+              msg: "Running wp core install so the site actually serves (health check needs 2xx)"
+
+          - name: Check if WordPress is already installed
+            command: wp core is-installed --path=/var/www/html/wordpress --allow-root
+            register: wp_is_installed
+            failed_when: false
+            changed_when: false
+
+          # --url is only a bootstrap seed for the DB row; the dynamic WP_HOME/WP_SITEURL in wp-config
+          # overrides it per-request. The health check uses http://localhost/wp-login.php locally.
+          - name: Complete WordPress first-run setup
+            command: >
+              wp core install
+              --path=/var/www/html/wordpress
+              --url=http://localhost/
+              --title="WordPress Store"
+              --admin_user=admin
+              --admin_password='{{ wordpress_admin_password.stdout }}'
+              --admin_email=admin@localhost.local
+              --skip-email
+              --allow-root
+            become: yes
+            become_user: www-data
+            when: wp_is_installed.rc != 0
+
+          - name: Set permalink structure for WooCommerce endpoints
+            command: wp rewrite structure '/%postname%/' --path=/var/www/html/wordpress --allow-root
+            become: yes
+            become_user: www-data
+
+          - name: Debug - installing WooCommerce plugin
+            debug:
+              msg: "Installing and activating the latest WooCommerce plugin"
+
+          - name: Check if WooCommerce is already active
+            command: wp plugin is-active woocommerce --path=/var/www/html/wordpress --allow-root
+            register: wc_active
+            failed_when: false
+            changed_when: false
+
+          - name: Install and activate WooCommerce (latest)
+            command: wp plugin install woocommerce --activate --path=/var/www/html/wordpress --allow-root
+            become: yes
+            become_user: www-data
+            when: wc_active.rc != 0
+
+          - name: Ensure correct ownership of WordPress files
+            file:
+              path: /var/www/html/wordpress
+              state: directory
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Final reload of Apache
+            service:
+              name: apache2
+              state: reloaded
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/wordpress-woocommerce-24-04/opt/cloudstack/wordpress-woocommerce_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/wordpress-woocommerce-24-04/opt/cloudstack/wordpress-woocommerce_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/wordpress-woocommerce_cleanup.sh && /opt/cloudstack/wordpress-woocommerce_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
