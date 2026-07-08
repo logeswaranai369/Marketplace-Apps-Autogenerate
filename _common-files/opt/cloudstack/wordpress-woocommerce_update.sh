@@ -2,8 +2,8 @@
 set -euo pipefail
 
 APP="wordpress-woocommerce"
-INSTALLED_VERSION="WordPress 6.7 (latest stable) + WooCommerce 9.x"
-UPSTREAM_SOURCE="apt:apache2,mariadb-server,php + wp-cli (WordPress core + WooCommerce plugin)"
+INSTALLED_VERSION="6.7"
+UPSTREAM_SOURCE="apt:wordpress (via wp-cli download) + wp-cli plugin install woocommerce"
 
 echo "== ${APP} update check =="
 echo "Installed version: ${INSTALLED_VERSION}"
