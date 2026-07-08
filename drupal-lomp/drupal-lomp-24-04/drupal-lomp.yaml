@@ -1,0 +1,372 @@
+- name: Drupal LOMP Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Drupal LOMP
+        block:
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+          - name: Generating drupal_db_password
+            shell: openssl rand -hex 24
+            register: drupal_db_password
+
+          - name: Storing drupal_db_password
+            copy:
+              dest: "/root/.drupal_db_password"
+              content: |
+                drupal_db_password = "{{ drupal_db_password.stdout }}"
+          - name: Generating drupal_admin_password
+            shell: openssl rand -hex 24
+            register: drupal_admin_password
+
+          - name: Storing drupal_admin_password
+            copy:
+              dest: "/root/.drupal_admin_password"
+              content: |
+                drupal_admin_password = "{{ drupal_admin_password.stdout }}"
+          - name: Generating openlitespeed_webadmin_password
+            shell: openssl rand -hex 24
+            register: openlitespeed_webadmin_password
+
+          - name: Storing openlitespeed_webadmin_password
+            copy:
+              dest: "/root/.openlitespeed_webadmin_password"
+              content: |
+                openlitespeed_webadmin_password = "{{ openlitespeed_webadmin_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Add LiteSpeed repository
+            shell: wget -O - https://repo.litespeed.sh | bash
+            args:
+              creates: /etc/apt/sources.list.d/lst_debian_repo.list
+
+          - name: "Stage 1 - install OpenLiteSpeed web server"
+            debug:
+              msg: "Installing OpenLiteSpeed web server (lsws)"
+
+          - name: Install OpenLiteSpeed
+            apt:
+              name: openlitespeed
+              state: latest
+              update_cache: yes
+
+          - name: "Stage 2 - install LiteSpeed PHP (lsphp83)"
+            debug:
+              msg: "Installing lsphp83 and only the extensions that exist for lsphp"
+
+          - name: Install lsphp83 and extensions
+            apt:
+              name:
+                - lsphp83
+                - lsphp83-common
+                - lsphp83-mysql
+                - lsphp83-curl
+                - lsphp83-intl
+                - lsphp83-opcache
+              state: latest
+
+          - name: Symlink lsphp83 binary into OpenLiteSpeed fcgi-bin
+            file:
+              src: /usr/local/lsws/lsphp83/bin/lsphp
+              dest: /usr/local/lsws/fcgi-bin/lsphp
+              state: link
+              force: yes
+
+          - name: "Stage 3 - install MariaDB database server"
+            debug:
+              msg: "Installing MariaDB server/client and PyMySQL"
+
+          - name: Install MariaDB and PyMySQL
+            apt:
+              name:
+                - mariadb-server
+                - mariadb-client
+                - python3-pymysql
+              state: latest
+
+          - name: "Stage 4 - install command-line tools and CLI PHP for Composer/Drush"
+            debug:
+              msg: "Installing tools plus mainline php-cli (lsphp has no plain php on PATH)"
+
+          - name: Install tools
+            apt:
+              name:
+                - curl
+                - wget
+                - unzip
+                - git
+              state: latest
+
+          # lsphp is a web-server SAPI only; there is no `php` on PATH for CLI tools like
+          # Composer/Drush, so install mainline php-cli + the extensions those tools need.
+          - name: Install php-cli and CLI extensions for Composer/Drush
+            apt:
+              name:
+                - php-cli
+                - php-mysql
+                - php-xml
+                - php-mbstring
+                - php-curl
+                - php-gd
+                - php-zip
+              state: latest
+
+          - name: Ensure MariaDB is enabled and running
+            service:
+              name: mariadb
+              state: started
+              enabled: yes
+
+          - name: "Stage 5 - secure MariaDB root (multi-auth, no lockout)"
+            debug:
+              msg: "Setting MariaDB root multi-auth (password OR unix_socket)"
+
+          # Multi-auth so root keeps both password and socket access — never locks out.
+          - name: Secure MariaDB root with multi-auth
+            shell: |
+              mysql -u root <<'SQL'
+              ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('{{ mysql_root_password.stdout }}') OR unix_socket;
+              FLUSH PRIVILEGES;
+              SQL
+            args:
+              executable: /bin/bash
+
+          - name: Create Drupal database
+            community.mysql.mysql_db:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: drupal_db
+              state: present
+
+          # host '%' so Drush connecting over TCP (127.0.0.1) matches the grant.
+          - name: Create Drupal database user
+            community.mysql.mysql_user:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: drupal_user
+              password: "{{ drupal_db_password.stdout }}"
+              host: "%"
+              priv: "drupal_db.*:ALL"
+              state: present
+
+          - name: "Stage 6 - install Composer"
+            debug:
+              msg: "Installing Composer via official installer"
+
+          - name: Download Composer installer
+            get_url:
+              url: https://getcomposer.org/installer
+              dest: /tmp/composer-setup.php
+              mode: '0644'
+
+          - name: Install Composer to /usr/local/bin
+            shell: php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+            args:
+              creates: /usr/local/bin/composer
+
+          - name: "Stage 7 - create Drupal project with Composer"
+            debug:
+              msg: "Creating drupal/recommended-project into /var/www/html"
+
+          - name: Check if Drupal project already exists
+            stat:
+              path: /var/www/html/composer.json
+            register: drupal_project
+
+          - name: Remove empty default web root before create-project
+            shell: rm -rf /var/www/html
+            when: not drupal_project.stat.exists
+
+          - name: Create Drupal recommended-project
+            shell: composer create-project drupal/recommended-project /var/www/html --no-interaction
+            environment:
+              COMPOSER_ALLOW_SUPERUSER: "1"
+            args:
+              creates: /var/www/html/composer.json
+
+          - name: Require Drush inside the project
+            shell: composer require drush/drush --no-interaction
+            environment:
+              COMPOSER_ALLOW_SUPERUSER: "1"
+            args:
+              chdir: /var/www/html
+              creates: /var/www/html/vendor/bin/drush
+
+          - name: Set ownership of Drupal project to www-data
+            file:
+              path: /var/www
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: "Stage 8 - install Drupal site with Drush"
+            debug:
+              msg: "Running non-interactive drush site-install"
+
+          - name: Check if Drupal is already installed
+            command: /var/www/html/vendor/bin/drush status --fields=bootstrap --root=/var/www/html
+            register: drupal_status
+            failed_when: false
+            changed_when: false
+
+          - name: Install Drupal site non-interactively
+            shell: >
+              /var/www/html/vendor/bin/drush -y site-install standard
+              --root=/var/www/html
+              --db-url=mysql://drupal_user:{{ drupal_db_password.stdout }}@127.0.0.1/drupal_db
+              --account-name=admin
+              --account-pass='{{ drupal_admin_password.stdout }}'
+              --site-name="Drupal Site"
+            environment:
+              COMPOSER_ALLOW_SUPERUSER: "1"
+            become: true
+            become_user: www-data
+            when: "'Successful' not in drupal_status.stdout"
+
+          - name: Ensure ownership after site install
+            file:
+              path: /var/www
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: "Stage 9 - configure OpenLiteSpeed"
+            debug:
+              msg: "Setting listener to :80, user www-data, docroot and index files"
+
+          - name: Set OpenLiteSpeed listener to port 80
+            replace:
+              path: /usr/local/lsws/conf/httpd_config.conf
+              regexp: 'address\s+\*:8088'
+              replace: 'address                  *:80'
+
+          - name: Set OpenLiteSpeed to run as www-data (user)
+            replace:
+              path: /usr/local/lsws/conf/httpd_config.conf
+              regexp: '^user\s+.*$'
+              replace: 'user                      www-data'
+
+          - name: Set OpenLiteSpeed to run as www-data (group)
+            replace:
+              path: /usr/local/lsws/conf/httpd_config.conf
+              regexp: '^group\s+.*$'
+              replace: 'group                     www-data'
+
+          - name: Point lsphp external processor to symlinked binary
+            replace:
+              path: /usr/local/lsws/conf/httpd_config.conf
+              regexp: 'fcgi-bin/lsphp\d*'
+              replace: 'fcgi-bin/lsphp'
+
+          - name: Set default vhost docRoot to Drupal web root
+            replace:
+              path: /usr/local/lsws/conf/vhosts/Example/vhconf.conf
+              regexp: '^\s*docRoot\s+.*$'
+              replace: '  docRoot                   /var/www/html/web/'
+
+          # A PHP app root serves nothing without index.php in the index list (404 at /).
+          - name: Ensure index.php is in the vhost index files
+            replace:
+              path: /usr/local/lsws/conf/vhosts/Example/vhconf.conf
+              regexp: '^\s*indexFiles\s+.*$'
+              replace: '  indexFiles                index.php, index.html'
+
+          # When OLS runs as www-data it must own its runtime socket dir or lsphp fails -> 503.
+          - name: Fix ownership of OpenLiteSpeed runtime socket directory
+            file:
+              path: /tmp/lshttpd
+              owner: www-data
+              group: www-data
+              state: directory
+              recurse: yes
+            ignore_errors: yes
+
+          - name: "Stage 10 - set OpenLiteSpeed WebAdmin password (non-interactive)"
+            debug:
+              msg: "Writing WebAdmin htpasswd without the interactive admpass.sh"
+
+          # NEVER run interactive admpass.sh under automation — it hangs. Compute the hash directly.
+          - name: Set WebAdmin console password
+            shell: |
+              ENCRYPT_PASS=$(/usr/local/lsws/admin/fcgi-bin/admin_php -q /usr/local/lsws/admin/misc/htpasswd.php '{{ openlitespeed_webadmin_password.stdout }}')
+              echo "admin:$ENCRYPT_PASS" > /usr/local/lsws/admin/conf/htpasswd
+            args:
+              executable: /bin/bash
+
+          - name: Enable and restart OpenLiteSpeed
+            service:
+              name: lsws
+              state: restarted
+              enabled: yes
+
+          - name: "Stage 11 - write credentials file"
+            debug:
+              msg: "Recording all generated credentials in /home/ubuntu/credentials.txt"
+
+          - name: Write credentials.txt
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+              content: |
+                Drupal LOMP Stack Credentials
+
+                MariaDB root password:        {{ mysql_root_password.stdout }}
+
+                Drupal database name:          drupal_db
+                Drupal database user:          drupal_user
+                Drupal database password:      {{ drupal_db_password.stdout }}
+
+                Drupal admin username:         admin
+                Drupal admin password:         {{ drupal_admin_password.stdout }}
+
+                OpenLiteSpeed WebAdmin URL:    https://<server-ip>:7080
+                OpenLiteSpeed WebAdmin user:   admin
+                OpenLiteSpeed WebAdmin pass:   {{ openlitespeed_webadmin_password.stdout }}
+
+          - name: Verify Drupal serves HTTP 200 on port 80
+            uri:
+              url: http://localhost/
+              status_code: 200
+              follow_redirects: all
+            register: drupal_http
+            retries: 5
+            delay: 5
+            until: drupal_http.status == 200
+            ignore_errors: yes
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/drupal-lomp-24-04/opt/cloudstack/drupal-lomp_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/drupal-lomp-24-04/opt/cloudstack/drupal-lomp_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/drupal-lomp_cleanup.sh && /opt/cloudstack/drupal-lomp_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
