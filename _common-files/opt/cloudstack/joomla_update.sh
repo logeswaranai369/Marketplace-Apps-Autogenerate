@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP="joomla"
-INSTALLED_VERSION="5.3.2"
+INSTALLED_VERSION="5.3.3"
 UPSTREAM_SOURCE="github:joomla/joomla-cms"
 
 echo "== ${APP} update check =="

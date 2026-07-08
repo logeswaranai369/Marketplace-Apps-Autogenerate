@@ -21,9 +21,6 @@ echo
 echo -e "${RED}Credential: mysql_root_password (stored at /root/.mysql_root_password)${NC}"
 cat /root/.mysql_root_password
 echo
-echo -e "${RED}Credential: ols_webadmin_password (stored at /root/.ols_webadmin_password)${NC}"
-cat /root/.ols_webadmin_password
-echo
 
 #Cleanup script
 rm -rf /usr/local/src/
