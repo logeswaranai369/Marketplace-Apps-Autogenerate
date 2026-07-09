@@ -1,0 +1,295 @@
+- name: Odoo Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Odoo
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating odoo_master_password
+            shell: openssl rand -hex 24
+            register: odoo_master_password
+
+          - name: Storing odoo_master_password
+            copy:
+              dest: "/root/.odoo_master_password"
+              content: |
+                odoo_master_password = "{{ odoo_master_password.stdout }}"
+          - name: Generating odoo_admin_password
+            shell: openssl rand -hex 24
+            register: odoo_admin_password
+
+          - name: Storing odoo_admin_password
+            copy:
+              dest: "/root/.odoo_admin_password"
+              content: |
+                odoo_admin_password = "{{ odoo_admin_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/odoo-24-04/etc/nginx/sites-available/odoo.conf', confdest: '/etc/nginx/sites-available/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install Odoo prerequisite packages
+            apt:
+              name:
+                - apt-transport-https
+                - ca-certificates
+                - curl
+                - software-properties-common
+                - gpg
+                - wget
+              state: latest
+              lock_timeout: 300
+
+          - name: Add Odoo repository signing key
+            shell: |
+              wget -q -O - https://nightly.odoo.com/odoo.key | gpg --dearmor -o /usr/share/keyrings/odoo-archive-keyring.gpg
+            args:
+              creates: /usr/share/keyrings/odoo-archive-keyring.gpg
+
+          - name: Add Odoo 17.0 nightly apt repository
+            copy:
+              dest: /etc/apt/sources.list.d/odoo.list
+              content: "deb [signed-by=/usr/share/keyrings/odoo-archive-keyring.gpg] https://nightly.odoo.com/17.0/nightly/deb/ ./\n"
+              mode: '0644'
+
+          - name: Update apt cache after adding Odoo repo
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Install PostgreSQL (Odoo database backend)
+            apt:
+              name: postgresql
+              state: latest
+              lock_timeout: 300
+
+          - name: Install nginx (reverse proxy)
+            apt:
+              name: nginx
+              state: latest
+              lock_timeout: 300
+
+          - name: Install Odoo 17.0 from official nightly repo
+            apt:
+              name: odoo
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure PostgreSQL is enabled and running
+            service:
+              name: postgresql
+              state: started
+              enabled: yes
+
+          - name: Debug - installing patched wkhtmltopdf for PDF reports
+            debug:
+              msg: "Installing patched wkhtmltopdf (jammy build) required for Odoo PDF reports"
+
+          - name: Check if wkhtmltopdf is already installed
+            command: dpkg -s wkhtmltox
+            register: wkhtml_installed
+            failed_when: false
+            changed_when: false
+
+          - name: Download patched wkhtmltopdf (jammy .deb - no noble build exists)
+            get_url:
+              url: https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.jammy_amd64.deb
+              dest: /tmp/wkhtmltox.deb
+              mode: '0644'
+            when: wkhtml_installed.rc != 0
+
+          - name: Install patched wkhtmltopdf (apt resolves deps, dpkg -i does not)
+            apt:
+              deb: /tmp/wkhtmltox.deb
+              state: present
+              lock_timeout: 300
+            when: wkhtml_installed.rc != 0
+
+          - name: Debug - configuring Odoo
+            debug:
+              msg: "Writing /etc/odoo/odoo.conf with generated master password and peer-auth DB settings"
+
+          - name: Ensure /etc/odoo directory exists
+            file:
+              path: /etc/odoo
+              state: directory
+              owner: odoo
+              group: odoo
+              mode: '0755'
+
+          - name: Ensure odoo PostgreSQL superuser role exists
+            shell: |
+              sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='odoo'" | grep -q 1 || sudo -u postgres createuser -s odoo
+            register: pg_role
+            changed_when: "'CREATE ROLE' in pg_role.stdout"
+
+          - name: Write Odoo configuration with real master password
+            copy:
+              dest: /etc/odoo/odoo.conf
+              owner: odoo
+              group: odoo
+              mode: '0640'
+              content: |
+                [options]
+                admin_passwd = {{ odoo_master_password.stdout }}
+                db_host = False
+                db_user = odoo
+                db_password = False
+                dbfilter = ^odoo$
+                list_db = False
+                proxy_mode = True
+                logfile = /var/log/odoo/odoo-server.log
+                addons_path = /usr/lib/python3/dist-packages/odoo/addons
+
+          - name: Ensure Odoo log directory exists
+            file:
+              path: /var/log/odoo
+              state: directory
+              owner: odoo
+              group: odoo
+              mode: '0755'
+
+          - name: Debug - initializing Odoo database
+            debug:
+              msg: "Initializing the 'odoo' database (base module, no demo data) if it does not already exist"
+
+          - name: Check if Odoo database already exists
+            shell: |
+              sudo -u postgres psql -lqt | cut -d '|' -f1 | grep -qw odoo
+            register: odoo_db_exists
+            failed_when: false
+            changed_when: false
+
+          - name: Stop Odoo service before DB init
+            service:
+              name: odoo
+              state: stopped
+            when: odoo_db_exists.rc != 0
+
+          - name: Initialize Odoo database (base module, no demo)
+            command: >
+              odoo -c /etc/odoo/odoo.conf -d odoo --init base
+              --without-demo=all --stop-after-init --load-language=en_US
+            become: yes
+            become_user: odoo
+            when: odoo_db_exists.rc != 0
+
+          - name: Set Odoo admin login password non-interactively
+            shell: |
+              echo "user = env['res.users'].search([('login','=','admin')], limit=1)
+              user.write({'password': '{{ odoo_admin_password.stdout }}'})
+              env.cr.commit()" | sudo -u odoo odoo shell -c /etc/odoo/odoo.conf -d odoo --no-http --stop-after-init
+            args:
+              executable: /bin/bash
+            when: odoo_db_exists.rc != 0
+
+          - name: Enable and start Odoo service
+            service:
+              name: odoo
+              state: started
+              enabled: yes
+
+          - name: Debug - configuring nginx reverse proxy
+            debug:
+              msg: "Enabling Odoo nginx site and removing the default site"
+
+          - name: Enable Odoo nginx site
+            file:
+              src: /etc/nginx/sites-available/odoo.conf
+              dest: /etc/nginx/sites-enabled/odoo.conf
+              state: link
+
+          - name: Remove default nginx site
+            file:
+              path: /etc/nginx/sites-enabled/default
+              state: absent
+
+          - name: Validate nginx configuration
+            command: nginx -t
+            changed_when: false
+
+          - name: Reload nginx to apply configuration
+            service:
+              name: nginx
+              state: reloaded
+              enabled: yes
+
+          - name: Debug - waiting for Odoo to finish first-run boot
+            debug:
+              msg: "Waiting for Odoo HTTP server to come up on 127.0.0.1:8069 (first-run module load is slow)"
+
+          - name: Wait for Odoo HTTP port to be listening
+            wait_for:
+              host: 127.0.0.1
+              port: 8069
+              timeout: 300
+
+          - name: Verify Odoo serves the login page via nginx (retry until 200)
+            uri:
+              url: http://localhost/web/login
+              follow_redirects: all
+              status_code: 200
+            register: odoo_http
+            retries: 30
+            delay: 10
+            until: odoo_http.status == 200
+
+          - name: Write credentials file for operator
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+              content: |
+                Odoo 17.0 Community
+                Site URL         : http://<server-ip>/
+                Login (admin)    : admin
+                Admin password   : {{ odoo_admin_password.stdout }}
+                Master password  : {{ odoo_master_password.stdout }}
+                Database name    : odoo
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/odoo-24-04/opt/cloudstack/odoo-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/odoo-24-04/opt/cloudstack/odoo-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/odoo-24-04_cleanup.sh && /opt/cloudstack/odoo-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
