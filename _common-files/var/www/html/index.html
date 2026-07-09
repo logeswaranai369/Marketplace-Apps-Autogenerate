@@ -1,27 +1,31 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>LEMP Stack Ready</title>
-    <style>
-        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #0f172a; color: #e2e8f0; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-        .card { background: #1e293b; padding: 2.5rem 3rem; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.4); max-width: 520px; }
-        h1 { margin-top: 0; color: #38bdf8; }
-        ul { line-height: 1.8; }
-        code { background: #334155; padding: 2px 6px; border-radius: 4px; }
-    </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenLiteSpeed Stack Ready</title>
+  <style>
+    body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #0f1419; color: #e6e6e6; margin: 0; display: flex; min-height: 100vh; align-items: center; justify-content: center; }
+    .card { background: #1a2129; border: 1px solid #2a3441; border-radius: 12px; padding: 40px 48px; max-width: 640px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+    h1 { margin: 0 0 8px; font-size: 26px; color: #ff6b35; }
+    p { line-height: 1.6; }
+    ul { line-height: 1.8; }
+    code { background: #0f1419; padding: 2px 6px; border-radius: 4px; color: #7cc4ff; }
+    .ok { color: #4caf50; font-weight: 600; }
+  </style>
 </head>
 <body>
-    <div class="card">
-        <h1>LEMP Stack Ready</h1>
-        <p>Your base hosting stack is up and running.</p>
-        <ul>
-            <li><strong>Nginx</strong> — web server on port 80</li>
-            <li><strong>MySQL 8</strong> — database engine (secured)</li>
-            <li><strong>PHP-FPM 8.3</strong> — PHP runtime via FastCGI</li>
-        </ul>
-        <p>Document root: <code>/var/www/html</code>. Drop your PHP application here.</p>
-    </div>
+  <div class="card">
+    <h1>OpenLiteSpeed Stack Ready</h1>
+    <p class="ok">&#10003; LOMP hosting stack provisioned successfully.</p>
+    <ul>
+      <li>Web server: <strong>OpenLiteSpeed</strong></li>
+      <li>PHP: <strong>lsphp 8.3</strong></li>
+      <li>Database: <strong>MySQL 8</strong></li>
+    </ul>
+    <p>Web root: <code>/var/www/html</code> &mdash; drop your PHP application here.</p>
+    <p>PHP execution probe: <code>/info.php</code></p>
+    <p>WebAdmin console: <code>https://&lt;host&gt;:7080</code></p>
+  </div>
 </body>
 </html>
