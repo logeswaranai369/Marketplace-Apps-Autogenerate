@@ -1,0 +1,236 @@
+- name: LEMP Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure LEMP
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/lemp-24-04/etc/nginx/sites-available/lemp', confdest: '/etc/nginx/sites-available/'}
+              - { confsrc: '/usr/local/src/lemp-24-04/var/www/html/index.html', confdest: '/var/www/html/'}
+              - { confsrc: '/usr/local/src/lemp-24-04/var/www/html/info.php', confdest: '/var/www/html/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Add ondrej/php PPA (provides php8.3 across Ubuntu releases)
+            apt_repository:
+              repo: ppa:ondrej/php
+              state: present
+              update_cache: yes
+
+          - name: Install Nginx web server
+            apt:
+              name: nginx
+              state: latest
+              lock_timeout: 300
+
+          - name: Install PHP-FPM 8.3 and required extensions
+            apt:
+              name:
+                - php8.3-fpm
+                - php8.3-cli
+                - php8.3-common
+                - php8.3-mysql
+                - php8.3-xml
+                - php8.3-mbstring
+                - php8.3-curl
+                - php8.3-gd
+                - php8.3-intl
+                - php8.3-zip
+                - php8.3-bcmath
+                - php8.3-soap
+                - php8.3-readline
+                - php8.3-opcache
+              state: latest
+              lock_timeout: 300
+
+          - name: Install MySQL 8 server and PyMySQL for Ansible
+            apt:
+              name:
+                - mysql-server
+                - python3-pymysql
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure Nginx, PHP-FPM and MySQL are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - nginx
+              - php8.3-fpm
+              - mysql
+
+          - name: Stage message before securing MySQL 8
+            debug:
+              msg: "Securing MySQL 8 root account (plugin-gated ALTER, no lockout)"
+
+          # MySQL 8 root auths via auth_socket and IGNORES -p, so a login test with the password
+          # would falsely succeed and skip the ALTER, breaking later DB tasks with error 1698.
+          # Gate the ALTER on the actual root PLUGIN instead of a login test.
+          - name: Set MySQL 8 root password only if still on auth_socket
+            shell: |
+              plugin=$(mysql -N -e "SELECT plugin FROM mysql.user WHERE user='root' AND host='localhost'")
+              if [ "$plugin" != "mysql_native_password" ]; then
+                mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ mysql_root_password.stdout }}'; FLUSH PRIVILEGES;"
+              fi
+            args:
+              executable: /bin/bash
+
+          # From here root uses password auth (auth_socket was replaced above), so pass login_user +
+          # login_password on all DB admin — login_unix_socket alone is a MariaDB-only trick.
+          - name: Remove anonymous MySQL users
+            community.mysql.mysql_user:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: ''
+              host_all: yes
+              state: absent
+
+          - name: Disallow remote root login
+            community.mysql.mysql_query:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              query: "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1')"
+            failed_when: false
+
+          - name: Drop the test database
+            community.mysql.mysql_db:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: test
+              state: absent
+
+          - name: Flush privileges
+            community.mysql.mysql_query:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              query: "FLUSH PRIVILEGES"
+
+          - name: Wire Nginx to serve the docroot via PHP-FPM
+            debug:
+              msg: "Enabling lemp server block, removing packaged default site"
+
+          - name: Enable the lemp Nginx server block
+            file:
+              src: /etc/nginx/sites-available/lemp
+              dest: /etc/nginx/sites-enabled/lemp
+              state: link
+              force: yes
+
+          - name: Remove packaged default Nginx site
+            file:
+              path: /etc/nginx/sites-enabled/default
+              state: absent
+
+          - name: Remove default Nginx debian landing page
+            file:
+              path: /var/www/html/index.nginx-debian.html
+              state: absent
+
+          - name: Set ownership of the web root
+            file:
+              path: /var/www/html
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Validate Nginx configuration
+            command: nginx -t
+            changed_when: false
+
+          - name: Reload Nginx to apply configuration
+            service:
+              name: nginx
+              state: reloaded
+
+          - name: Write operator credentials and stack notes
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                LEMP Stack (Nginx + MySQL 8 + PHP-FPM 8.3) on Ubuntu 24.04
+                MySQL root user     : root
+                MySQL root password : {{ mysql_root_password.stdout }}
+                Connect             : mysql -u root -p
+                Web root            : /var/www/html  (drop your PHP application here)
+                PHP-FPM socket      : /run/php/php8.3-fpm.sock
+
+                SECURITY: delete /var/www/html/info.php after verifying the PHP
+                pipeline (it exposes the PHP version):
+                    rm /var/www/html/info.php
+
+          - name: Verify landing page serves HTTP 200
+            uri:
+              url: http://localhost/
+              return_content: yes
+            register: lemp_landing
+            retries: 5
+            delay: 3
+            until: lemp_landing.status == 200
+
+          - name: Verify nginx to PHP-FPM pipeline executes PHP
+            uri:
+              url: http://localhost/info.php
+              return_content: yes
+            register: lemp_php
+            failed_when: lemp_php.status != 200 or 'PHP OK' not in lemp_php.content
+            retries: 5
+            delay: 3
+            until: lemp_php.status == 200 and 'PHP OK' in lemp_php.content
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/lemp-24-04/opt/cloudstack/lemp-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/lemp-24-04/opt/cloudstack/lemp-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/lemp-24-04_cleanup.sh && /opt/cloudstack/lemp-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
