@@ -1,0 +1,413 @@
+- name: Magento 2 Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Magento 2
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+          - name: Generating magento_db_password
+            shell: openssl rand -hex 24
+            register: magento_db_password
+
+          - name: Storing magento_db_password
+            copy:
+              dest: "/root/.magento_db_password"
+              content: |
+                magento_db_password = "{{ magento_db_password.stdout }}"
+          - name: Generating magento_admin_password
+            shell: openssl rand -hex 24
+            register: magento_admin_password
+
+          - name: Storing magento_admin_password
+            copy:
+              dest: "/root/.magento_admin_password"
+              content: |
+                magento_admin_password = "{{ magento_admin_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/magento-2-24-04/var/www/.config/composer/auth.json', confdest: '/var/www/.config/composer/'}
+              - { confsrc: '/usr/local/src/magento-2-24-04/etc/apache2/sites-available/magento.conf', confdest: '/etc/apache2/sites-available/'}
+              - { confsrc: '/usr/local/src/magento-2-24-04/etc/opensearch/jvm.options.d/heap.options', confdest: '/etc/opensearch/jvm.options.d/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Add ondrej PHP PPA (php8.2 across all Ubuntu releases)
+            apt_repository:
+              repo: ppa:ondrej/php
+              state: present
+            register: php_ppa
+
+          - name: Update apt cache after adding PHP PPA
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+            when: php_ppa is changed
+
+          - name: "Stage 1 - install Apache + mod_php"
+            debug:
+              msg: "Installing Apache web server and mod_php"
+
+          - name: Install Apache and mod_php
+            apt:
+              name:
+                - apache2
+                - libapache2-mod-php8.2
+              state: latest
+              lock_timeout: 300
+
+          - name: "Stage 2 - install PHP 8.2 CLI and extensions"
+            debug:
+              msg: "Installing PHP 8.2 and Magento-required extensions"
+
+          - name: Install PHP 8.2 and required extensions
+            apt:
+              name:
+                - php8.2-cli
+                - php8.2-fpm
+                - php8.2-common
+                - php8.2-mysql
+                - php8.2-xml
+                - php8.2-curl
+                - php8.2-zip
+                - php8.2-bcmath
+                - php8.2-soap
+                - php8.2-mbstring
+                - php8.2-intl
+                - php8.2-gd
+                - php8.2-bz2
+                - php8.2-gmp
+                - php8.2-imagick
+              state: latest
+              lock_timeout: 300
+
+          - name: Raise PHP CLI memory_limit for Composer/Magento
+            lineinfile:
+              path: /etc/php/8.2/cli/php.ini
+              regexp: '^memory_limit'
+              line: 'memory_limit = -1'
+              backrefs: no
+            ignore_errors: yes
+
+          - name: "Stage 3 - install MySQL 8 and DB tooling"
+            debug:
+              msg: "Installing MySQL 8 server (Magento 2.4.7 rejects MariaDB 10.11)"
+
+          - name: Install MySQL 8 server and PyMySQL
+            apt:
+              name:
+                - mysql-server
+                - python3-pymysql
+              state: latest
+              lock_timeout: 300
+
+          - name: "Stage 4 - install build tools"
+            debug:
+              msg: "Installing composer, git, unzip, curl"
+
+          - name: Install build/utility tools
+            apt:
+              name:
+                - composer
+                - unzip
+                - git
+                - curl
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure Apache and MySQL are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - apache2
+              - mysql
+
+          - name: "Stage 5 - install OpenSearch 2.x (mandatory search engine)"
+            debug:
+              msg: "Setting up OpenSearch 2.x repository and package"
+
+          - name: Add OpenSearch GPG key
+            shell: |
+              curl -fsSL https://artifacts.opensearch.org/publickeys/opensearch.pgp | gpg --dearmor -o /usr/share/keyrings/opensearch-keyring.gpg
+            args:
+              creates: /usr/share/keyrings/opensearch-keyring.gpg
+
+          - name: Add OpenSearch 2.x apt repository
+            copy:
+              dest: /etc/apt/sources.list.d/opensearch-2.x.list
+              content: "deb [signed-by=/usr/share/keyrings/opensearch-keyring.gpg] https://artifacts.opensearch.org/releases/bundle/opensearch/2.x/apt stable main\n"
+              mode: '0644'
+            register: opensearch_repo
+
+          - name: Update apt cache after adding OpenSearch repo
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+            when: opensearch_repo is changed
+
+          - name: Install OpenSearch
+            apt:
+              name: opensearch
+              state: latest
+              lock_timeout: 300
+            environment:
+              OPENSEARCH_INITIAL_ADMIN_PASSWORD: "{{ magento_admin_password.stdout }}Aa1!"
+
+          - name: Disable OpenSearch security plugin (plain HTTP on 9200 for local Magento)
+            blockinfile:
+              path: /etc/opensearch/opensearch.yml
+              marker: "# {mark} MARKGEN OPENSEARCH SECURITY"
+              block: |
+                plugins.security.disabled: true
+                network.host: 127.0.0.1
+                discovery.type: single-node
+
+          - name: Constrain OpenSearch JVM heap
+            copy:
+              dest: /etc/opensearch/jvm.options.d/heap.options
+              content: "-Xms512m\n-Xmx512m\n"
+              mode: '0644'
+
+          - name: Enable and start OpenSearch
+            service:
+              name: opensearch
+              state: restarted
+              enabled: yes
+
+          - name: Wait for OpenSearch to answer on 9200
+            uri:
+              url: http://localhost:9200/
+              status_code: 200
+            register: opensearch_up
+            retries: 30
+            delay: 10
+            until: opensearch_up.status == 200
+
+          - name: "Stage 6 - configure MySQL database and user"
+            debug:
+              msg: "Creating Magento database and user (over unix socket, before securing root)"
+
+          # Create DB + user over the unix socket while root still uses auth_socket.
+          - name: Create Magento database and user
+            shell: |
+              mysql <<'SQL'
+              CREATE DATABASE IF NOT EXISTS magento CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+              CREATE USER IF NOT EXISTS 'magento'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ magento_db_password.stdout }}';
+              ALTER USER 'magento'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ magento_db_password.stdout }}';
+              GRANT ALL PRIVILEGES ON magento.* TO 'magento'@'localhost';
+              FLUSH PRIVILEGES;
+              SQL
+            args:
+              executable: /bin/bash
+
+          # Secure root LAST. MySQL 8 fresh root uses auth_socket; switch to native password.
+          - name: Secure MySQL 8 root with native password
+            shell: |
+              mysql <<'SQL'
+              ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ mysql_root_password.stdout }}';
+              FLUSH PRIVILEGES;
+              SQL
+            args:
+              executable: /bin/bash
+
+          - name: "Stage 7 - Composer create-project (Magento Open Source 2.4.7-p3)"
+            debug:
+              msg: "Downloading Magento via Composer as www-data"
+
+          - name: Ensure Composer home directory exists and is writable by www-data
+            file:
+              path: /var/www/.config/composer
+              state: directory
+              owner: www-data
+              group: www-data
+              mode: '0755'
+
+          - name: Remove Apache default index so create-project sees an empty target
+            file:
+              path: /var/www/html/index.html
+              state: absent
+
+          - name: Ensure /var/www is owned by www-data
+            file:
+              path: /var/www
+              state: directory
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Check if Magento is already downloaded
+            stat:
+              path: /var/www/html/bin/magento
+            register: magento_downloaded
+
+          - name: Composer create-project Magento 2.4.7-p3
+            become: yes
+            become_user: www-data
+            command:
+              cmd: composer create-project --prefer-dist --no-dev --no-interaction --repository-url=https://repo.magento.com/ magento/project-community-edition=2.4.7-p3 /var/www/html
+              chdir: /var/www
+              creates: /var/www/html/bin/magento
+            environment:
+              COMPOSER_HOME: /var/www/.config/composer
+              COMPOSER_ALLOW_SUPERUSER: "1"
+              COMPOSER_MEMORY_LIMIT: "-1"
+            when: not magento_downloaded.stat.exists
+
+          - name: "Stage 8 - run Magento setup:install"
+            debug:
+              msg: "Running Magento setup:install (idempotent via env.php guard)"
+
+          - name: Check if Magento is already installed
+            stat:
+              path: /var/www/html/app/etc/env.php
+            register: magento_installed
+
+          - name: Run Magento setup:install
+            become: yes
+            become_user: www-data
+            command:
+              cmd: >
+                php bin/magento setup:install
+                --base-url=http://localhost/
+                --db-host=localhost
+                --db-name=magento
+                --db-user=magento
+                --db-password='{{ magento_db_password.stdout }}'
+                --admin-firstname=Admin
+                --admin-lastname=User
+                --admin-email=admin@localhost.local
+                --admin-user=admin
+                --admin-password='{{ magento_admin_password.stdout }}'
+                --language=en_US
+                --currency=USD
+                --timezone=America/New_York
+                --use-rewrites=1
+                --search-engine=opensearch
+                --opensearch-host=localhost
+                --opensearch-port=9200
+              chdir: /var/www/html
+            environment:
+              COMPOSER_HOME: /var/www/.config/composer
+              COMPOSER_ALLOW_SUPERUSER: "1"
+              COMPOSER_MEMORY_LIMIT: "-1"
+            when: not magento_installed.stat.exists
+
+          - name: Set Magento to developer mode (avoid OOM from compile/deploy on small VMs)
+            become: yes
+            become_user: www-data
+            command:
+              cmd: php bin/magento deploy:mode:set developer
+              chdir: /var/www/html
+            when: not magento_installed.stat.exists
+
+          - name: Disable 2FA modules that block headless admin login
+            become: yes
+            become_user: www-data
+            command:
+              cmd: php bin/magento module:disable Magento_AdminAdobeImsTwoFactorAuth Magento_TwoFactorAuth
+              chdir: /var/www/html
+            when: not magento_installed.stat.exists
+            ignore_errors: yes
+
+          - name: Flush Magento cache
+            become: yes
+            become_user: www-data
+            command:
+              cmd: php bin/magento cache:flush
+              chdir: /var/www/html
+            when: not magento_installed.stat.exists
+            ignore_errors: yes
+
+          - name: Ensure Magento files owned by www-data
+            file:
+              path: /var/www/html
+              state: directory
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: "Stage 9 - configure Apache vhost"
+            debug:
+              msg: "Enabling Magento vhost and mod_rewrite"
+
+          - name: Enable rewrite module, magento site and disable default
+            command: "{{ item }}"
+            loop:
+              - a2enmod rewrite
+              - a2ensite magento
+              - a2dissite 000-default
+            ignore_errors: yes
+
+          - name: Restart Apache to apply configuration
+            service:
+              name: apache2
+              state: restarted
+
+          - name: "Stage 10 - verify storefront serves HTTP 200"
+            debug:
+              msg: "Checking Magento storefront on http://localhost/"
+
+          - name: Wait for Magento storefront to return 200
+            uri:
+              url: http://localhost/
+              status_code: 200
+              follow_redirects: all
+            register: magento_http
+            retries: 20
+            delay: 15
+            until: magento_http.status == 200
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/magento-2-24-04/opt/cloudstack/magento-2-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/magento-2-24-04/opt/cloudstack/magento-2-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/magento-2-24-04_cleanup.sh && /opt/cloudstack/magento-2-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
