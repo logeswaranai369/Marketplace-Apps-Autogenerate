@@ -1,0 +1,341 @@
+- name: MediaWiki Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure MediaWiki
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+          - name: Generating mediawiki_db_password
+            shell: openssl rand -hex 24
+            register: mediawiki_db_password
+
+          - name: Storing mediawiki_db_password
+            copy:
+              dest: "/root/.mediawiki_db_password"
+              content: |
+                mediawiki_db_password = "{{ mediawiki_db_password.stdout }}"
+          - name: Generating mediawiki_admin_password
+            shell: openssl rand -hex 24
+            register: mediawiki_admin_password
+
+          - name: Storing mediawiki_admin_password
+            copy:
+              dest: "/root/.mediawiki_admin_password"
+              content: |
+                mediawiki_admin_password = "{{ mediawiki_admin_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/mediawiki-24-04/etc/apache2/conf-available/mediawiki.conf', confdest: '/etc/apache2/conf-available/'}
+              - { confsrc: '/usr/local/src/mediawiki-24-04/etc/php/8.2/apache2/conf.d/99-mediawiki.ini', confdest: '/etc/php/8.2/apache2/conf.d/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Add ondrej PHP PPA
+            apt_repository:
+              repo: ppa:ondrej/php
+              state: present
+              update_cache: yes
+            register: php_ppa
+            retries: 3
+            delay: 5
+            until: php_ppa is succeeded
+
+          - name: Install Apache web server
+            apt:
+              name:
+                - apache2
+              state: latest
+              lock_timeout: 300
+
+          - name: Install PHP 8.2 and required extensions
+            apt:
+              name:
+                - libapache2-mod-php8.2
+                - php8.2-mysql
+                - php8.2-xml
+                - php8.2-mbstring
+                - php8.2-curl
+                - php8.2-gd
+                - php8.2-intl
+                - php8.2-zip
+                - php8.2-dom
+                - php8.2-apcu
+                - php8.2-bcmath
+              state: latest
+              lock_timeout: 300
+
+          - name: Install MySQL server and tools
+            apt:
+              name:
+                - mysql-server
+                - imagemagick
+                - python3-pymysql
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure Apache and MySQL are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - apache2
+              - mysql
+
+          - name: Stage - securing MySQL 8 root account
+            debug:
+              msg: "Setting MySQL 8 root password over the unix socket (still works at this moment)"
+
+          # MySQL 8 has NO 'OR unix_socket' multi-auth: once the root password is set, socket auth is
+          # REPLACED. This ALTER USER (run over the socket, which still works before the password is set)
+          # switches root to mysql_native_password. After this, EVERY DB-admin task MUST authenticate
+          # with login_user=root + login_password. Idempotent: ALTER USER is re-runnable.
+          - name: Set MySQL 8 root password (mysql_native_password) over the socket
+            shell: |
+              mysql -u root <<'SQL'
+              ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ mysql_root_password.stdout }}';
+              FLUSH PRIVILEGES;
+              SQL
+            args:
+              executable: /bin/bash
+            register: mysql_root_set
+            failed_when: false
+            changed_when: mysql_root_set.rc == 0
+
+          # If the password was ALREADY set on a prior run, the socket-only shell above fails silently
+          # (rc != 0 tolerated). Verify we can authenticate with the password before proceeding.
+          - name: Verify MySQL root password works
+            command: mysql -u root -p'{{ mysql_root_password.stdout }}' -e "SELECT 1;"
+            changed_when: false
+
+          - name: Stage - creating MediaWiki database and user
+            debug:
+              msg: "Creating the mediawiki database and application user (auth as root with password)"
+
+          - name: Create MediaWiki database
+            community.mysql.mysql_db:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: mediawiki
+              state: present
+
+          - name: Create MediaWiki database user
+            community.mysql.mysql_user:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: mediawiki
+              password: "{{ mediawiki_db_password.stdout }}"
+              host: localhost
+              plugin: mysql_native_password
+              priv: "mediawiki.*:ALL"
+              state: present
+
+          - name: Stage - deploying MediaWiki files
+            debug:
+              msg: "Downloading and extracting MediaWiki 1.43.9 into /var/www/html"
+
+          - name: Download MediaWiki tarball
+            get_url:
+              url: https://releases.wikimedia.org/mediawiki/1.43/mediawiki-1.43.9.tar.gz
+              dest: /tmp/mediawiki-1.43.9.tar.gz
+              mode: '0644'
+
+          - name: Remove Apache default index.html
+            file:
+              path: /var/www/html/index.html
+              state: absent
+
+          - name: Check if MediaWiki is already extracted
+            stat:
+              path: /var/www/html/maintenance/install.php
+            register: mw_extracted
+
+          - name: Extract MediaWiki to docroot
+            unarchive:
+              src: /tmp/mediawiki-1.43.9.tar.gz
+              dest: /var/www/html
+              remote_src: yes
+              extra_opts:
+                - --strip-components=1
+              owner: www-data
+              group: www-data
+            when: not mw_extracted.stat.exists
+
+          - name: Ensure MediaWiki files owned by www-data
+            file:
+              path: /var/www/html
+              state: directory
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Stage - configuring Apache and PHP
+            debug:
+              msg: "Applying AllowOverride config, PHP limits, and enabling rewrite"
+
+          - name: Deploy MediaWiki Apache config (AllowOverride All)
+            copy:
+              dest: /etc/apache2/conf-available/mediawiki.conf
+              content: |
+                <Directory /var/www/html>
+                    Options FollowSymLinks
+                    AllowOverride All
+                    Require all granted
+                </Directory>
+              mode: '0644'
+
+          - name: Deploy MediaWiki PHP limits
+            copy:
+              dest: /etc/php/8.2/apache2/conf.d/99-mediawiki.ini
+              content: |
+                upload_max_filesize = 80M
+                post_max_size = 32M
+                memory_limit = 512M
+                max_execution_time = 360
+              mode: '0644'
+
+          - name: Enable rewrite module and mediawiki conf
+            command: "{{ item }}"
+            loop:
+              - a2enmod rewrite
+              - a2enconf mediawiki
+            register: apache_enable
+            changed_when: "'already enabled' not in apache_enable.stdout"
+
+          - name: Restart Apache to apply configuration
+            service:
+              name: apache2
+              state: restarted
+
+          - name: Stage - running MediaWiki CLI installer
+            debug:
+              msg: "Running the non-interactive MediaWiki CLI installer (writes LocalSettings.php + populates DB)"
+
+          - name: Check if MediaWiki is already installed
+            stat:
+              path: /var/www/html/LocalSettings.php
+            register: mw_localsettings
+
+          # Non-interactive CLI installer only — NEVER the web wizard (no TTY under Ansible/cloud-init).
+          # Last two positional args are the wiki NAME then the admin USERNAME. --scriptpath="" serves
+          # the wiki at the site root.
+          - name: Run MediaWiki CLI installer
+            command: >
+              php maintenance/install.php
+              --dbtype=mysql --dbserver=localhost
+              --dbname=mediawiki --dbuser=mediawiki --dbpass='{{ mediawiki_db_password.stdout }}'
+              --installdbuser=root --installdbpass='{{ mysql_root_password.stdout }}'
+              --scriptpath=""
+              --lang=en
+              --pass='{{ mediawiki_admin_password.stdout }}'
+              "My Wiki" "admin"
+            args:
+              chdir: /var/www/html
+            become: yes
+            become_user: www-data
+            when: not mw_localsettings.stat.exists
+
+          - name: Ensure LocalSettings.php owned by www-data
+            file:
+              path: /var/www/html/LocalSettings.php
+              owner: www-data
+              group: www-data
+              mode: '0640'
+
+          # The public URL of a CloudStack NAT VM is unknown at install time (guest only sees a private
+          # IP). install.php hardcodes $wgServer = "http://localhost". Replace it with a protocol-relative
+          # host-based value so the wiki serves correctly on whatever IP/hostname the browser uses.
+          - name: Make MediaWiki URL-agnostic (derive host from request)
+            replace:
+              path: /var/www/html/LocalSettings.php
+              regexp: '^\$wgServer\s*=\s*".*";'
+              replace: '$wgServer = "//" . $_SERVER[''HTTP_HOST''];'
+
+          - name: Run MediaWiki schema updater
+            command: php maintenance/update.php --quick
+            args:
+              chdir: /var/www/html
+            become: yes
+            become_user: www-data
+            changed_when: false
+
+          - name: Restart Apache after install
+            service:
+              name: apache2
+              state: restarted
+
+          - name: Stage - recording credentials
+            debug:
+              msg: "Writing credentials to /home/ubuntu/credentials.txt"
+
+          - name: Record credentials
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              content: |
+                MediaWiki Site
+                Site URL:       http://<server-ip>/
+                Admin user:     admin
+                Admin password: {{ mediawiki_admin_password.stdout }}
+
+                Database
+                DB name:        mediawiki
+                DB user:        mediawiki
+                DB password:    {{ mediawiki_db_password.stdout }}
+                MySQL root pw:  {{ mysql_root_password.stdout }}
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/mediawiki-24-04/opt/cloudstack/mediawiki-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/mediawiki-24-04/opt/cloudstack/mediawiki-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/mediawiki-24-04_cleanup.sh && /opt/cloudstack/mediawiki-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
