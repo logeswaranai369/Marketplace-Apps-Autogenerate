@@ -3,17 +3,16 @@
 <head>
     <meta charset="utf-8">
     <title>Varnish Cache Active</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body { font-family: sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1rem; color: #222; }
+        body { font-family: sans-serif; max-width: 640px; margin: 4em auto; padding: 0 1em; color: #222; }
         h1 { color: #c9302c; }
-        code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
+        code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; }
     </style>
 </head>
 <body>
-    <h1>Varnish cache active</h1>
+    <h1>Varnish cache is active</h1>
     <p>This page is served by an nginx backend on <code>127.0.0.1:8080</code> and cached by Varnish on port <code>80</code>.</p>
-    <p>Check the <code>X-Cache</code> response header (<code>HIT</code>/<code>MISS</code>) to confirm caching.</p>
-    <p>Edit the backend in <code>/etc/varnish/default.vcl</code> to point Varnish at your real application.</p>
+    <p>Check the <code>X-Cache</code> and <code>Via</code> response headers to confirm the request passed through Varnish.</p>
+    <p>To serve your own application, point the Varnish backend in <code>/etc/varnish/default.vcl</code> at your app's host and port.</p>
 </body>
 </html>

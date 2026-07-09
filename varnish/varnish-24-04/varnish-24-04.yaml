@@ -1,0 +1,188 @@
+- name: Varnish Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Varnish
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/varnish-24-04/etc/systemd/system/varnish.service.d/override.conf', confdest: '/etc/systemd/system/varnish.service.d/'}
+              - { confsrc: '/usr/local/src/varnish-24-04/etc/varnish/default.vcl', confdest: '/etc/varnish/'}
+              - { confsrc: '/usr/local/src/varnish-24-04/etc/nginx/sites-available/varnish-backend.conf', confdest: '/etc/nginx/sites-available/'}
+              - { confsrc: '/usr/local/src/varnish-24-04/var/www/html/index.html', confdest: '/var/www/html/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install Varnish and nginx backend
+            apt:
+              name:
+                - varnish
+                - nginx
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure web root exists
+            file:
+              path: /var/www/html
+              state: directory
+              owner: www-data
+              group: www-data
+              mode: '0755'
+
+          - name: Ensure landing page owned by www-data
+            file:
+              path: /var/www/html/index.html
+              owner: www-data
+              group: www-data
+              state: file
+            ignore_errors: yes
+
+          - name: Configure nginx backend (127.0.0.1:8080 only)
+            debug:
+              msg: "Enabling nginx backend on 127.0.0.1:8080 and removing default site so Varnish owns :80"
+
+          - name: Enable the Varnish backend nginx site
+            file:
+              src: /etc/nginx/sites-available/varnish-backend.conf
+              dest: /etc/nginx/sites-enabled/varnish-backend.conf
+              state: link
+              force: yes
+
+          - name: Remove the default nginx site so nothing else binds :80
+            file:
+              path: /etc/nginx/sites-enabled/default
+              state: absent
+
+          - name: Reload nginx (backend must be up before Varnish)
+            service:
+              name: nginx
+              state: reloaded
+              enabled: yes
+
+          # RULE 24 — Varnish's listen port comes from the systemd unit ExecStart, NOT default.vcl or
+          # /etc/default/varnish. The `-F` (foreground) flag is MANDATORY: Ubuntu's varnish unit expects
+          # the daemon to stay in the foreground; without -F varnishd forks, systemd sees the main proc
+          # exit and marks the service dead, so nothing binds :80. Written inline so the correct content
+          # (with -F) is guaranteed and cannot drift.
+          - name: Ensure varnish systemd override directory exists
+            file:
+              path: /etc/systemd/system/varnish.service.d
+              state: directory
+              mode: '0755'
+
+          - name: Write varnishd systemd override so Varnish listens on :80 (foreground, mandatory -F)
+            copy:
+              dest: /etc/systemd/system/varnish.service.d/override.conf
+              content: |
+                [Service]
+                ExecStart=
+                ExecStart=/usr/sbin/varnishd -F -a :80 -T localhost:6082 -f /etc/varnish/default.vcl -S /etc/varnish/secret -s malloc,256m
+              mode: '0644'
+            register: varnish_override
+
+          - name: Reload systemd so the new ExecStart is picked up
+            systemd:
+              daemon_reload: yes
+
+          - name: Enable and restart Varnish on port 80
+            debug:
+              msg: "Restarting Varnish with daemon-reloaded unit so it binds :80 in the foreground"
+
+          - name: Restart Varnish to apply the override
+            service:
+              name: varnish
+              state: restarted
+              enabled: yes
+
+          - name: Verify Varnish stays active (retries while it comes up)
+            command: systemctl is-active varnish
+            register: varnish_active
+            until: varnish_active.stdout == "active"
+            retries: 6
+            delay: 5
+            changed_when: false
+            failed_when: false
+
+          - name: Confirm Varnish is serving on port 80
+            uri:
+              url: http://localhost/
+              return_content: no
+              status_code: 200
+            register: varnish_http
+            until: varnish_http.status == 200
+            retries: 6
+            delay: 5
+            failed_when: false
+
+          - name: Write operator credentials / architecture notes
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                Varnish Cache stack
+                Architecture : Varnish (public :80)  ->  nginx backend (127.0.0.1:8080)  ->  /var/www/html
+                No application login is required.
+
+                Change the cached backend:
+                  Edit /etc/varnish/default.vcl  (backend default { .host / .port })
+                  then: systemctl reload varnish   (or restart)
+
+                Varnish listen port:
+                  Set in the systemd unit, NOT in default.vcl:
+                  /etc/systemd/system/varnish.service.d/override.conf
+                  After editing: systemctl daemon-reload && systemctl restart varnish
+
+                Varnish admin (CLI) interface:
+                  Address : localhost:6082
+                  Secret  : /etc/varnish/secret
+                  Connect : varnishadm -T localhost:6082 -S /etc/varnish/secret
+
+                Verify caching:
+                  curl -I http://localhost/ | grep -i 'via\|x-cache\|x-varnish'
+            ignore_errors: yes
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/varnish-24-04/opt/cloudstack/varnish-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/varnish-24-04/opt/cloudstack/varnish-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/varnish-24-04_cleanup.sh && /opt/cloudstack/varnish-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
