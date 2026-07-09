@@ -1,0 +1,443 @@
+- name: Joomla Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Joomla
+        block:
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+
+          - name: Generating joomla_admin_password
+            shell: openssl rand -hex 24
+            register: joomla_admin_password
+
+          - name: Storing joomla_admin_password
+            copy:
+              dest: "/root/.joomla_admin_password"
+              content: |
+                joomla_admin_password = "{{ joomla_admin_password.stdout }}"
+          - name: Generating joomla_db_password
+            shell: openssl rand -hex 24
+            register: joomla_db_password
+
+          - name: Storing joomla_db_password
+            copy:
+              dest: "/root/.joomla_db_password"
+              content: |
+                joomla_db_password = "{{ joomla_db_password.stdout }}"
+          - name: Generating mariadb_root_password
+            shell: openssl rand -hex 24
+            register: mariadb_root_password
+
+          - name: Storing mariadb_root_password
+            copy:
+              dest: "/root/.mariadb_root_password"
+              content: |
+                mariadb_root_password = "{{ mariadb_root_password.stdout }}"
+          - name: Generating ols_webadmin_password
+            shell: openssl rand -hex 24
+            register: ols_webadmin_password
+
+          - name: Storing ols_webadmin_password
+            copy:
+              dest: "/root/.ols_webadmin_password"
+              content: |
+                ols_webadmin_password = "{{ ols_webadmin_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/joomla-lomp-24-04/usr/local/lsws/conf/vhosts/joomla/vhconf.conf', confdest: '/usr/local/lsws/conf/vhosts/joomla/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Enable the LiteSpeed repository
+            shell: |
+              set -e
+              if [ ! -f /etc/apt/sources.list.d/lst_debian_repo.list ]; then
+                wget -qO /tmp/enable_lst_debian_repo.sh https://repo.litespeed.sh
+                bash /tmp/enable_lst_debian_repo.sh
+              fi
+            args:
+              executable: /bin/bash
+            register: litespeed_repo
+            changed_when: "'lst_debian_repo' in litespeed_repo.stdout or litespeed_repo.rc == 0"
+
+          - name: Update apt cache after adding LiteSpeed repo
+            apt:
+              update_cache: yes
+
+          - name: "Stage 1 - install OpenLiteSpeed web server"
+            debug:
+              msg: "Installing OpenLiteSpeed web server"
+
+          - name: Install OpenLiteSpeed
+            package:
+              name:
+                - openlitespeed
+              state: latest
+
+          - name: "Stage 2 - install lsphp83 and needed extensions"
+            debug:
+              msg: "Installing lsphp83 (base + common bundle gd/mbstring/xml/zip) and separate extensions"
+
+          - name: Install lsphp83 and its separate extensions
+            package:
+              name:
+                - lsphp83
+                - lsphp83-common
+                - lsphp83-mysql
+                - lsphp83-intl
+                - lsphp83-curl
+                - lsphp83-opcache
+              state: latest
+
+          - name: "Stage 3 - install MariaDB and PyMySQL"
+            debug:
+              msg: "Installing MariaDB server and python3-pymysql"
+
+          - name: Install MariaDB server and PyMySQL
+            package:
+              name:
+                - mariadb-server
+                - python3-pymysql
+              state: latest
+
+          - name: "Stage 4 - install mainline PHP CLI for the Joomla CLI installer"
+            debug:
+              msg: "Installing php-cli and CLI extensions (lsphp has no php on PATH)"
+
+          - name: Install mainline PHP CLI and extensions
+            package:
+              name:
+                - php-cli
+                - php-mysql
+                - php-xml
+                - php-mbstring
+                - php-curl
+                - php-gd
+                - php-intl
+                - php-zip
+              state: latest
+
+          - name: Ensure MariaDB is enabled and running
+            service:
+              name: mariadb
+              state: started
+              enabled: yes
+
+          - name: "Stage 5 - secure MariaDB root without lockout"
+            debug:
+              msg: "Setting MariaDB root multi-auth (password OR unix_socket) over the socket"
+
+          # Multi-auth: root can log in by the generated password OR by unix_socket, so `sudo mysql`
+          # keeps working and no lockout is possible. Idempotent (ALTER USER re-runnable).
+          - name: Secure MariaDB root (password + keep socket auth; no lockout)
+            shell: |
+              mysql -u root <<'SQL'
+              ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('{{ mariadb_root_password.stdout }}') OR unix_socket;
+              FLUSH PRIVILEGES;
+              SQL
+            args:
+              executable: /bin/bash
+
+          - name: Create Joomla database
+            community.mysql.mysql_db:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: joomla
+              state: present
+
+          - name: Create Joomla database user
+            community.mysql.mysql_user:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: joomla
+              password: "{{ joomla_db_password.stdout }}"
+              host: localhost
+              priv: "joomla.*:ALL"
+              state: present
+
+          - name: "Stage 6 - download and extract Joomla"
+            debug:
+              msg: "Downloading Joomla 5.x Full Package and extracting into /var/www/html"
+
+          - name: Ensure web root exists
+            file:
+              path: /var/www/html
+              state: directory
+              owner: www-data
+              group: www-data
+              mode: '0755'
+
+          - name: Download Joomla Full Package tarball
+            get_url:
+              url: https://github.com/joomla/joomla-cms/releases/download/5.3.3/Joomla_5.3.3-Stable-Full_Package.tar.gz
+              dest: /tmp/joomla.tar.gz
+              mode: '0644'
+
+          - name: Check if Joomla is already extracted
+            stat:
+              path: /var/www/html/libraries/src/Version.php
+            register: joomla_extracted
+
+          - name: Extract Joomla into web root
+            unarchive:
+              src: /tmp/joomla.tar.gz
+              dest: /var/www/html
+              remote_src: yes
+              owner: www-data
+              group: www-data
+            when: not joomla_extracted.stat.exists
+
+          - name: Ensure web root ownership is www-data
+            file:
+              path: /var/www/html
+              state: directory
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: "Stage 7 - run the Joomla non-interactive CLI installer"
+            debug:
+              msg: "Running the Joomla CLI installer (never the web installer)"
+
+          - name: Check if Joomla is already installed
+            stat:
+              path: /var/www/html/configuration.php
+            register: joomla_configured
+
+          # Runs as www-data with the mainline php CLI. $live_site is left empty so Joomla
+          # auto-detects the URL from the Host header (works behind CloudStack NAT).
+          - name: Install Joomla via CLI
+            become: yes
+            become_user: www-data
+            command: >
+              php installation/joomla.php install
+              --site-name="Joomla Site"
+              --admin-user="Administrator"
+              --admin-username=admin
+              --admin-password='{{ joomla_admin_password.stdout }}'
+              --admin-email=admin@localhost.local
+              --db-type=mysqli
+              --db-host=localhost
+              --db-user=joomla
+              --db-pass='{{ joomla_db_password.stdout }}'
+              --db-name=joomla
+              --db-prefix=jos_
+              --db-encryption=0
+            args:
+              chdir: /var/www/html
+            when: not joomla_configured.stat.exists
+
+          - name: Remove the Joomla installation directory
+            file:
+              path: /var/www/html/installation
+              state: absent
+
+          - name: "Stage 8 - configure OpenLiteSpeed listener and vhost"
+            debug:
+              msg: "Wiring OLS listener on :80, joomla vhost, www-data, and index.php"
+
+          - name: Create Joomla vhost config directory
+            file:
+              path: /usr/local/lsws/conf/vhosts/joomla
+              state: directory
+              owner: www-data
+              group: www-data
+              mode: '0755'
+
+          - name: Deploy Joomla OLS vhost config
+            copy:
+              dest: /usr/local/lsws/conf/vhosts/joomla/vhconf.conf
+              owner: www-data
+              group: www-data
+              mode: '0644'
+              content: |
+                docRoot                   /var/www/html/
+                vhDomain                  *
+                adminEmails               admin@localhost.local
+                enableGzip                1
+
+                index  {
+                  useServer               0
+                  indexFiles              index.php, index.html
+                }
+
+                errorlog $VH_ROOT/logs/error.log {
+                  useServer               0
+                  logLevel                WARN
+                  rollingSize             10M
+                }
+
+                accesslog $VH_ROOT/logs/access.log {
+                  useServer               0
+                  rollingSize             10M
+                  keepDays                30
+                }
+
+                scripthandler  {
+                  add                     lsapi:lsphp php
+                }
+
+                extprocessor lsphp {
+                  type                    lsapi
+                  address                 uds://tmp/lshttpd/lsphp.sock
+                  maxConns                10
+                  env                     PHP_LSAPI_CHILDREN=10
+                  initTimeout             60
+                  retryTimeout            0
+                  persistConn             1
+                  respBuffer              0
+                  autoStart               1
+                  path                    /usr/local/lsws/lsphp83/bin/lsphp
+                  backlog                 100
+                  instances               1
+                  extUser                 www-data
+                  extGroup                www-data
+                  memSoftLimit            2047M
+                  memHardLimit            2047M
+                  procSoftLimit           1400
+                  procHardLimit           1500
+                }
+
+                rewrite  {
+                  enable                  1
+                  autoLoadHtaccess        1
+                  rules                   <<<END_rules
+                RewriteEngine On
+                RewriteCond %{REQUEST_FILENAME} !-f
+                RewriteCond %{REQUEST_FILENAME} !-d
+                RewriteRule ^(.*)$ index.php [L]
+                END_rules
+                }
+
+          - name: Create OLS vhost logs directory
+            file:
+              path: /var/www/html/logs
+              state: directory
+              owner: www-data
+              group: www-data
+              mode: '0755'
+
+          - name: Run OpenLiteSpeed as www-data
+            replace:
+              path: /usr/local/lsws/conf/httpd_config.conf
+              regexp: '^(user|group)\s+.*$'
+              replace: '\g<1>                        www-data'
+
+          - name: Edit the existing Default listener to bind on port 80
+            replace:
+              path: /usr/local/lsws/conf/httpd_config.conf
+              regexp: 'address\s+\*:8088'
+              replace: 'address                 *:80'
+
+          - name: Register the joomla virtualHost in OLS main config
+            blockinfile:
+              path: /usr/local/lsws/conf/httpd_config.conf
+              marker: "# {mark} MARKGEN JOOMLA VHOST"
+              block: |
+                virtualHost joomla {
+                  vhRoot                  /var/www/html/
+                  configFile              conf/vhosts/joomla/vhconf.conf
+                  allowSymbolLink         1
+                  enableScript            1
+                  restrained              1
+                }
+
+          - name: Point the Default listener map at the joomla vhost
+            replace:
+              path: /usr/local/lsws/conf/httpd_config.conf
+              regexp: '^(\s*)map\s+Example\s+.*$'
+              replace: '\g<1>map                     joomla *'
+
+          - name: "Stage 9 - set OLS WebAdmin password non-interactively"
+            debug:
+              msg: "Setting WebAdmin password via htpasswd.php (never admpass.sh which hangs)"
+
+          # NEVER use admpass.sh — it prompts on a TTY and hangs under automation.
+          - name: Set OLS WebAdmin (7080) password via htpasswd.php
+            shell: |
+              set -e
+              ENCRYPT_PASS=$(/usr/local/lsws/admin/fcgi-bin/admin_php -q /usr/local/lsws/admin/misc/htpasswd.php '{{ ols_webadmin_password.stdout }}')
+              echo "admin:$ENCRYPT_PASS" > /usr/local/lsws/admin/conf/htpasswd
+            args:
+              executable: /bin/bash
+
+          - name: Fix ownership of the OLS runtime socket directory
+            file:
+              path: /tmp/lshttpd
+              state: directory
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Enable OpenLiteSpeed service
+            service:
+              name: lsws
+              enabled: yes
+
+          - name: Restart OpenLiteSpeed to apply configuration
+            command: /usr/local/lsws/bin/lswsctrl restart
+
+          - name: "Stage 10 - store credentials for the operator"
+            debug:
+              msg: "Writing credentials.txt after successful install"
+
+          - name: Store credentials for operator retrieval
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                Joomla Admin URL: http://<server-ip>/administrator
+                Joomla Admin Username: admin
+                Joomla Admin Password: {{ joomla_admin_password.stdout }}
+
+                Joomla Database Name: joomla
+                Joomla Database User: joomla
+                Joomla Database Password: {{ joomla_db_password.stdout }}
+
+                MariaDB root Password: {{ mariadb_root_password.stdout }}
+
+                OpenLiteSpeed WebAdmin URL: https://<server-ip>:7080
+                OpenLiteSpeed WebAdmin Username: admin
+                OpenLiteSpeed WebAdmin Password: {{ ols_webadmin_password.stdout }}
+
+          - name: "Stage 11 - verify Joomla is actually serving on port 80"
+            debug:
+              msg: "Verifying HTTP 200 from the Joomla home page"
+
+          - name: Wait for Joomla home page to return HTTP 200
+            uri:
+              url: http://localhost/
+              status_code: 200
+              follow_redirects: all
+            register: joomla_health
+            until: joomla_health.status == 200
+            retries: 12
+            delay: 5
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/joomla-lomp-24-04/opt/cloudstack/joomla-lomp-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/joomla-lomp-24-04/opt/cloudstack/joomla-lomp-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/joomla-lomp-24-04_cleanup.sh && /opt/cloudstack/joomla-lomp-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
