@@ -1,0 +1,293 @@
+- name: LAMP Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure LAMP
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/lamp-24-04/etc/apache2/conf-available/lamp-override.conf', confdest: '/etc/apache2/conf-available/'}
+              - { confsrc: '/usr/local/src/lamp-24-04/var/www/html/info.php', confdest: '/var/www/html/'}
+              - { confsrc: '/usr/local/src/lamp-24-04/var/www/html/index.html', confdest: '/var/www/html/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Add ondrej PHP PPA (per-release codename resolved automatically)
+            apt_repository:
+              repo: ppa:ondrej/php
+              state: present
+
+          - name: Install Apache web server
+            apt:
+              name: apache2
+              state: latest
+              lock_timeout: 300
+
+          - name: Install MySQL 8 server and PyMySQL
+            apt:
+              name:
+                - mysql-server
+                - python3-pymysql
+              state: latest
+              lock_timeout: 300
+
+          - name: Install PHP 8.3 and required extensions
+            apt:
+              name:
+                - libapache2-mod-php8.3
+                - php8.3-cli
+                - php8.3-common
+                - php8.3-mysql
+                - php8.3-xml
+                - php8.3-mbstring
+                - php8.3-curl
+                - php8.3-gd
+                - php8.3-intl
+                - php8.3-zip
+                - php8.3-bcmath
+                - php8.3-soap
+                - php8.3-readline
+                - php8.3-opcache
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure Apache and MySQL are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - apache2
+              - mysql
+
+          - name: Prepare Apache stage
+            debug:
+              msg: "Configuring Apache modules and vhost overrides"
+
+          - name: Deploy LAMP Apache override config
+            copy:
+              dest: /etc/apache2/conf-available/lamp-override.conf
+              content: |
+                <Directory /var/www/html>
+                    Options Indexes FollowSymLinks
+                    AllowOverride All
+                    Require all granted
+                </Directory>
+
+                <IfModule dir_module>
+                    DirectoryIndex index.php index.html index.htm
+                </IfModule>
+              mode: '0644'
+
+          - name: Enable rewrite module and lamp-override config
+            command: "{{ item }}"
+            loop:
+              - a2enmod rewrite
+              - a2enconf lamp-override
+            register: apache_enable
+            changed_when: "'already enabled' not in apache_enable.stdout"
+
+          - name: Restart Apache to apply modules/config
+            service:
+              name: apache2
+              state: restarted
+
+          - name: Deploy web content stage
+            debug:
+              msg: "Deploying branded landing page and PHP probe"
+
+          - name: Deploy branded landing page (overwrites Apache default index.html)
+            copy:
+              dest: /var/www/html/index.html
+              content: |
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="utf-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1">
+                    <title>LAMP Stack Ready</title>
+                    <style>
+                        body { font-family: system-ui, -apple-system, sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1rem; color: #222; }
+                        h1 { color: #2d6a4f; }
+                        code { background: #f0f0f0; padding: 0.1rem 0.35rem; border-radius: 3px; }
+                        ul { line-height: 1.8; }
+                    </style>
+                </head>
+                <body>
+                    <h1>LAMP stack ready ✅</h1>
+                    <p>This server is running a base LAMP development stack on Ubuntu 24.04 LTS.</p>
+                    <ul>
+                        <li>Linux &mdash; Ubuntu 24.04 LTS</li>
+                        <li>Apache &mdash; apache2 (2.4)</li>
+                        <li>MySQL &mdash; 8.x</li>
+                        <li>PHP &mdash; 8.3 (via ppa:ondrej/php)</li>
+                    </ul>
+                    <p>Drop your PHP application into <code>/var/www/html</code>.</p>
+                    <p>PHP probe: <a href="/info.php">/info.php</a></p>
+                </body>
+                </html>
+              owner: www-data
+              group: www-data
+              mode: '0644'
+
+          - name: Deploy PHP probe (proves mod_php executes end-to-end)
+            copy:
+              dest: /var/www/html/info.php
+              content: |
+                <?php
+                header('Content-Type: text/plain');
+                echo 'PHP OK ' . PHP_VERSION;
+              owner: www-data
+              group: www-data
+              mode: '0644'
+
+          - name: Ensure web root ownership
+            file:
+              path: /var/www/html
+              state: directory
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Secure MySQL 8 root stage
+            debug:
+              msg: "Securing MySQL 8 root account (plugin-gated, avoids auth_socket lockout)"
+
+          # MySQL 8 auths root via auth_socket by default and IGNORES -p when run as OS root.
+          # Gate on the PLUGIN (not a login test) so the ALTER is applied exactly once and
+          # subsequent password-based admin does not hit ERROR 1698.
+          - name: Set MySQL 8 root password if still on auth_socket
+            shell: |
+              plugin=$(mysql -N -e "SELECT plugin FROM mysql.user WHERE user='root' AND host='localhost'")
+              if [ "$plugin" != "mysql_native_password" ]; then
+                mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ mysql_root_password.stdout }}'; FLUSH PRIVILEGES;"
+              fi
+            args:
+              executable: /bin/bash
+
+          - name: Remove anonymous MySQL users
+            community.mysql.mysql_user:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: ''
+              host_all: yes
+              state: absent
+
+          - name: Disallow remote root login
+            community.mysql.mysql_query:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              query: "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1')"
+            register: root_cleanup
+            failed_when: false
+
+          - name: Drop the test database
+            community.mysql.mysql_db:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: test
+              state: absent
+
+          - name: Flush privileges
+            community.mysql.mysql_query:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              query: "FLUSH PRIVILEGES"
+
+          - name: Write human-readable credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              content: |
+                LAMP Stack Credentials
+
+                MySQL root login:
+                  user:     root
+                  password: {{ mysql_root_password.stdout }}
+                  connect:  mysql -u root -p
+
+                Web root: /var/www/html
+                  Drop your PHP application files into /var/www/html.
+
+                NOTE: Delete /var/www/html/info.php after verifying PHP works
+                      (it exposes the PHP version):  rm /var/www/html/info.php
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+            ignore_errors: yes
+
+          - name: Verify stack serves stage
+            debug:
+              msg: "Verifying Apache serves landing page and PHP probe"
+
+          - name: Verify landing page returns 200 with real content
+            uri:
+              url: http://localhost/
+              return_content: yes
+            register: landing
+            retries: 5
+            delay: 3
+            until: landing.status == 200 and 'LAMP stack ready' in landing.content
+
+          - name: Verify PHP probe executes (mod_php pipeline)
+            uri:
+              url: http://localhost/info.php
+              return_content: yes
+            register: probe
+            retries: 5
+            delay: 3
+            until: probe.status == 200 and 'PHP OK' in probe.content
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/lamp-24-04/opt/cloudstack/lamp-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/lamp-24-04/opt/cloudstack/lamp-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/lamp-24-04_cleanup.sh && /opt/cloudstack/lamp-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
