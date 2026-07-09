@@ -1,0 +1,315 @@
+- name: SLiMS (Senayan Library Management System) Bulian Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure SLiMS (Senayan Library Management System) Bulian
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+          - name: Generating slims_db_password
+            shell: openssl rand -hex 24
+            register: slims_db_password
+
+          - name: Storing slims_db_password
+            copy:
+              dest: "/root/.slims_db_password"
+              content: |
+                slims_db_password = "{{ slims_db_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/slims-24-04/etc/apache2/conf-available/slims.conf', confdest: '/etc/apache2/conf-available/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Add ondrej PHP PPA (for PHP 8.1)
+            apt_repository:
+              repo: "ppa:ondrej/php"
+              state: present
+
+          - name: Install Apache web server
+            apt:
+              name:
+                - apache2
+              state: latest
+              lock_timeout: 300
+
+          - name: Install PHP 8.1 and required extensions
+            apt:
+              name:
+                - libapache2-mod-php8.1
+                - php8.1-mysql
+                - php8.1-mbstring
+                - php8.1-gd
+                - php8.1-intl
+                - php8.1-xml
+                - php8.1-zip
+                - php8.1-curl
+                - php8.1-cli
+                - php8.1-common
+              state: latest
+              lock_timeout: 300
+
+          - name: Install MySQL 8 server and tools
+            apt:
+              name:
+                - mysql-server
+                - python3-pymysql
+                - unzip
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure Apache and MySQL are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - apache2
+              - mysql
+
+          - name: Configure Apache AllowOverride for SLiMS
+            copy:
+              dest: /etc/apache2/conf-available/slims.conf
+              content: |
+                <Directory /var/www/html>
+                    Options FollowSymLinks
+                    AllowOverride All
+                    Require all granted
+                </Directory>
+              mode: '0644'
+
+          - name: Enable rewrite module and SLiMS conf
+            command: "{{ item }}"
+            loop:
+              - a2enmod rewrite
+              - a2enconf slims
+            ignore_errors: yes
+
+          - name: Remove default Apache index.html
+            file:
+              path: /var/www/html/index.html
+              state: absent
+
+          - name: Reload Apache to apply configuration
+            service:
+              name: apache2
+              state: reloaded
+
+          - name: "Secure MySQL 8 root - gate on the auth plugin, not a login test"
+            shell: |
+              plugin=$(mysql -N -e "SELECT plugin FROM mysql.user WHERE user='root' AND host='localhost'")
+              if [ "$plugin" != "mysql_native_password" ]; then
+                mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ mysql_root_password.stdout }}'; FLUSH PRIVILEGES;"
+              fi
+            args:
+              executable: /bin/bash
+
+          - name: Create SLiMS database
+            community.mysql.mysql_db:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: slims
+              encoding: utf8mb4
+              state: present
+
+          - name: Create SLiMS database user
+            community.mysql.mysql_user:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: slims
+              password: "{{ slims_db_password.stdout }}"
+              host: localhost
+              plugin: mysql_native_password
+              priv: "slims.*:ALL"
+              state: present
+
+          - name: Check if SLiMS is already extracted
+            stat:
+              path: /var/www/html/index.php
+            register: slims_installed
+
+          - name: Download SLiMS 9.8.0 release
+            get_url:
+              url: https://github.com/slims/slims9_bulian/releases/download/v9.8.0/slims9_bulian-9.8.0.zip
+              dest: /tmp/slims9_bulian-9.8.0.zip
+              mode: '0644'
+            when: not slims_installed.stat.exists
+
+          - name: Extract SLiMS archive to temporary location
+            unarchive:
+              src: /tmp/slims9_bulian-9.8.0.zip
+              dest: /tmp
+              remote_src: yes
+            when: not slims_installed.stat.exists
+
+          - name: Copy SLiMS contents into web root
+            shell: cp -a /tmp/slims9_bulian-9.8.0/. /var/www/html/
+            args:
+              executable: /bin/bash
+            when: not slims_installed.stat.exists
+
+          - name: Check if SLiMS schema is already imported
+            command: >
+              mysql -u root -p'{{ mysql_root_password.stdout }}' -N -e
+              "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='slims'"
+            register: slims_table_count
+            changed_when: false
+
+          - name: Import SLiMS database schema
+            shell: mysql -u root -p'{{ mysql_root_password.stdout }}' slims < /var/www/html/install/senayan.sql
+            args:
+              executable: /bin/bash
+            when: slims_table_count.stdout | int == 0
+
+          - name: Check if SLiMS database config exists
+            stat:
+              path: /var/www/html/config/database.php
+            register: slims_dbconfig
+
+          - name: Create database.php from sample
+            copy:
+              src: /var/www/html/config/database.sample.php
+              dest: /var/www/html/config/database.php
+              remote_src: yes
+            when: not slims_dbconfig.stat.exists
+
+          - name: Set database connection values in database.php
+            replace:
+              path: /var/www/html/config/database.php
+              regexp: "{{ item.token }}"
+              replace: "{{ item.value }}"
+            loop:
+              - { token: '_DB_HOST_', value: 'localhost' }
+              - { token: '_DB_NAME_', value: 'slims' }
+              - { token: '_DB_PORT_', value: '3306' }
+              - { token: '_DB_USER_', value: 'slims' }
+              - { token: '_DB_PASSWORD_', value: "{{ slims_db_password.stdout }}" }
+              - { token: '_STORAGE_ENGINE_', value: 'InnoDB' }
+            when: not slims_dbconfig.stat.exists
+
+          - name: Set ownership of SLiMS web root
+            file:
+              path: /var/www/html
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Set writable permissions on SLiMS runtime directories
+            file:
+              path: "/var/www/html/{{ item }}"
+              state: directory
+              mode: '0775'
+              recurse: yes
+            loop:
+              - config
+              - files
+              - images
+              - repository
+
+          - name: Check if env.php already exists
+            stat:
+              path: /var/www/html/config/env.php
+            register: slims_env
+
+          # SLiMS 9.8 REQUIRED env step. This command EXITS 1 even on success (and on re-run says
+          # 'env.php is still exists'). Do NOT trust the exit code — guard on env.php + failed_when false.
+          - name: Run SLiMS environment setup (writes config/env.php)
+            shell: cd /var/www/html && sudo -u www-data php index.php env
+            args:
+              executable: /bin/bash
+            register: slims_env_result
+            failed_when: false
+            when: not slims_env.stat.exists
+
+          - name: Verify env.php was created
+            stat:
+              path: /var/www/html/config/env.php
+            register: slims_env_check
+            failed_when: not slims_env_check.stat.exists
+
+          - name: Remove install directory (security)
+            file:
+              path: /var/www/html/install
+              state: absent
+
+          - name: Reload Apache after SLiMS deployment
+            service:
+              name: apache2
+              state: reloaded
+
+          - name: Write credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              content: |
+                SLiMS (Senayan Library Management System) Bulian 9.8.0
+                Site URL:       http://<server-ip>/
+                Admin panel:    http://<server-ip>/admin/
+
+                SLiMS Admin Login (CHANGE ON FIRST LOGIN - Admin > Librarian):
+                  Username: admin
+                  Password: admin
+
+                MySQL root:
+                  User:     root
+                  Password: {{ mysql_root_password.stdout }}
+
+                SLiMS Database:
+                  Database: slims
+                  User:     slims
+                  Password: {{ slims_db_password.stdout }}
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/slims-24-04/opt/cloudstack/slims-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/slims-24-04/opt/cloudstack/slims-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/slims-24-04_cleanup.sh && /opt/cloudstack/slims-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
