@@ -1,0 +1,31 @@
+# ======================== Elasticsearch Configuration =========================
+#
+# Single-node marketplace image configuration.
+# Security (TLS + auth) is DISABLED by default for ease of use.
+# See /home/ubuntu/credentials.txt for how to ENABLE security for production.
+#
+# ---------------------------------- Cluster -----------------------------------
+cluster.name: stackbill-elasticsearch
+#
+# ------------------------------------ Node ------------------------------------
+node.name: node-1
+#
+# ----------------------------------- Paths ------------------------------------
+path.data: /var/lib/elasticsearch
+path.logs: /var/log/elasticsearch
+#
+# ---------------------------------- Network -----------------------------------
+network.host: 0.0.0.0
+http.port: 9200
+#
+# --------------------------------- Discovery ----------------------------------
+discovery.type: single-node
+#
+# ---------------------------------- Security ----------------------------------
+# Disabled for a base single-node marketplace image so the API answers plain
+# HTTP 200 on port 9200. Re-enable ALL of these for production and set the
+# elastic user password (elasticsearch-reset-password -u elastic).
+xpack.security.enabled: false
+xpack.security.enrollment.enabled: false
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false

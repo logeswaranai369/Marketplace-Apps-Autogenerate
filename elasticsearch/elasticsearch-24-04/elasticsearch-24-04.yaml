@@ -1,0 +1,179 @@
+- name: Elasticsearch Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Elasticsearch
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/elasticsearch-24-04/etc/elasticsearch/elasticsearch.yml', confdest: '/etc/elasticsearch/'}
+              - { confsrc: '/usr/local/src/elasticsearch-24-04/etc/elasticsearch/jvm.options.d/heap.options', confdest: '/etc/elasticsearch/jvm.options.d/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Add Elastic GPG signing key
+            shell: |
+              curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
+            args:
+              executable: /bin/bash
+              creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+
+          - name: Add Elasticsearch 8.x apt repository
+            apt_repository:
+              repo: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main"
+              state: present
+              filename: elastic-8.x
+
+          - name: Install Elasticsearch package (Java is bundled - no separate JDK)
+            apt:
+              name: elasticsearch
+              state: latest
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Configure Elasticsearch single-node dev config
+            debug:
+              msg: "Applying single-node config and DISABLING security BEFORE first start so the REST API answers plain HTTP 200 on 9200."
+
+          # ES 8.x deb postinst appends a "# BEGIN SECURITY AUTO CONFIGURATION" block that enables
+          # TLS + auth. We remove it so our disabled-security settings do not create DUPLICATE keys
+          # (which would make ES refuse to start). Idempotent: no-op once the block is gone.
+          - name: Remove ES auto-generated security configuration block
+            replace:
+              path: /etc/elasticsearch/elasticsearch.yml
+              regexp: '(?s)#\s*BEGIN SECURITY AUTO CONFIGURATION.*?#\s*END SECURITY AUTO CONFIGURATION\n?'
+              replace: ''
+
+          - name: Apply single-node + disabled-security settings (idempotent, before first start)
+            lineinfile:
+              path: /etc/elasticsearch/elasticsearch.yml
+              regexp: "{{ item.regexp }}"
+              line: "{{ item.line }}"
+              state: present
+            loop:
+              - { regexp: '^#?\s*cluster\.name:.*', line: 'cluster.name: stackbill-elasticsearch' }
+              - { regexp: '^#?\s*node\.name:.*', line: 'node.name: node-1' }
+              - { regexp: '^#?\s*path\.data:.*', line: 'path.data: /var/lib/elasticsearch' }
+              - { regexp: '^#?\s*path\.logs:.*', line: 'path.logs: /var/log/elasticsearch' }
+              - { regexp: '^#?\s*network\.host:.*', line: 'network.host: 0.0.0.0' }
+              - { regexp: '^#?\s*http\.port:.*', line: 'http.port: 9200' }
+              - { regexp: '^#?\s*discovery\.type:.*', line: 'discovery.type: single-node' }
+              - { regexp: '^#?\s*xpack\.security\.enabled:.*', line: 'xpack.security.enabled: false' }
+              - { regexp: '^#?\s*xpack\.security\.enrollment\.enabled:.*', line: 'xpack.security.enrollment.enabled: false' }
+              - { regexp: '^#?\s*xpack\.security\.http\.ssl\.enabled:.*', line: 'xpack.security.http.ssl.enabled: false' }
+              - { regexp: '^#?\s*xpack\.security\.transport\.ssl\.enabled:.*', line: 'xpack.security.transport.ssl.enabled: false' }
+
+          # Remove leftover master-node hint the auto-config may have left (ignored under single-node,
+          # but keep the file clean). Non-fatal if absent.
+          - name: Remove stale cluster.initial_master_nodes setting
+            lineinfile:
+              path: /etc/elasticsearch/elasticsearch.yml
+              regexp: '^#?\s*cluster\.initial_master_nodes:.*'
+              state: absent
+
+          - name: Bound JVM heap for reliable first boot on small VMs
+            copy:
+              dest: /etc/elasticsearch/jvm.options.d/heap.options
+              content: |
+                -Xms512m
+                -Xmx512m
+              owner: root
+              group: elasticsearch
+              mode: '0660'
+
+          - name: Reload systemd and enable + start Elasticsearch
+            debug:
+              msg: "Starting Elasticsearch. First boot can take 30-90s to accept connections."
+
+          - name: Reload systemd daemon
+            systemd:
+              daemon_reload: yes
+
+          - name: Enable and start Elasticsearch service
+            service:
+              name: elasticsearch
+              state: started
+              enabled: yes
+
+          # ES is slow on first boot (JVM + index recovery). Wait with retries so the REST API is
+          # genuinely serving before we finish — a plain 200 JSON banner with cluster_name over HTTP.
+          - name: Wait for Elasticsearch REST API to serve a real 200 banner
+            uri:
+              url: http://localhost:9200/
+              status_code: 200
+              return_content: yes
+            register: es_banner
+            until: es_banner.status == 200 and 'cluster_name' in es_banner.content
+            retries: 20
+            delay: 10
+
+          - name: Write credentials / access notes
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                Elasticsearch 8.x - StackBill Marketplace Image
+                REST API URL : http://<this-server-ip>:9200/
+                Cluster name : stackbill-elasticsearch
+                Node name    : node-1
+
+                SECURITY: DISABLED by default for ease of use (plain HTTP, no auth).
+
+                To ENABLE security for PRODUCTION:
+                  1. Edit /etc/elasticsearch/elasticsearch.yml and set:
+                       xpack.security.enabled: true
+                       xpack.security.enrollment.enabled: true
+                       xpack.security.http.ssl.enabled: true
+                       xpack.security.transport.ssl.enabled: true
+                  2. systemctl restart elasticsearch
+                  3. Set the elastic user password:
+                       /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic
+
+                FIREWALL: TCP port 9200 must be open in the security group to reach
+                the API remotely.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/elasticsearch-24-04/opt/cloudstack/elasticsearch-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/elasticsearch-24-04/opt/cloudstack/elasticsearch-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/elasticsearch-24-04_cleanup.sh && /opt/cloudstack/elasticsearch-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
