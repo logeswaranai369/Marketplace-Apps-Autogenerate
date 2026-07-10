@@ -1,0 +1,250 @@
+- name: Harbor Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Harbor
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating harbor_admin_password
+            shell: openssl rand -hex 24
+            register: harbor_admin_password
+
+          - name: Storing harbor_admin_password
+            copy:
+              dest: "/root/.harbor_admin_password"
+              content: |
+                harbor_admin_password = "{{ harbor_admin_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/harbor-24-04/etc/systemd/system/harbor.service', confdest: '/etc/systemd/system/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages for Docker repository
+            apt:
+              name:
+                - ca-certificates
+                - curl
+                - gnupg
+              state: latest
+              lock_timeout: 300
+
+          - name: Create apt keyrings directory
+            file:
+              path: /etc/apt/keyrings
+              state: directory
+              mode: '0755'
+
+          - name: Download Docker GPG key
+            shell: |
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            args:
+              creates: /etc/apt/keyrings/docker.gpg
+
+          - name: Ensure Docker GPG key is world-readable
+            file:
+              path: /etc/apt/keyrings/docker.gpg
+              mode: '0644'
+
+          - name: Add Docker CE apt repository (codename resolved per Ubuntu version)
+            apt_repository:
+              repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+              filename: docker
+              state: present
+
+          - name: Install Docker CE and Compose plugin
+            apt:
+              name:
+                - docker-ce
+                - docker-ce-cli
+                - containerd.io
+                - docker-buildx-plugin
+                - docker-compose-plugin
+              state: latest
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Ensure Docker engine is enabled and running
+            service:
+              name: docker
+              state: started
+              enabled: yes
+
+          - name: Stage - download Harbor offline installer (large ~670MB, long timeout)
+            debug:
+              msg: "Downloading Harbor v2.13.2 offline installer (this is large and may take several minutes)"
+
+          - name: Download Harbor offline installer
+            get_url:
+              url: https://github.com/goharbor/harbor/releases/download/v2.13.2/harbor-offline-installer-v2.13.2.tgz
+              dest: /opt/harbor-offline-installer-v2.13.2.tgz
+              mode: '0644'
+              timeout: 120
+            register: harbor_download
+            until: harbor_download is succeeded
+            retries: 5
+            delay: 15
+
+          - name: Extract Harbor installer to /opt/harbor
+            unarchive:
+              src: /opt/harbor-offline-installer-v2.13.2.tgz
+              dest: /opt
+              remote_src: yes
+              creates: /opt/harbor/install.sh
+
+          - name: Stage - configure harbor.yml
+            debug:
+              msg: "Generating /opt/harbor/harbor.yml from template (HTTP-only, dynamic hostname, generated admin password)"
+
+          - name: Create harbor.yml from the shipped template
+            copy:
+              src: /opt/harbor/harbor.yml.tmpl
+              dest: /opt/harbor/harbor.yml
+              remote_src: yes
+              mode: '0640'
+              force: no
+
+          - name: Set Harbor hostname to the VM's primary IP (never localhost - baked into registry URLs)
+            replace:
+              path: /opt/harbor/harbor.yml
+              regexp: '^hostname:.*'
+              replace: 'hostname: "{{ ansible_default_ipv4.address }}"'
+
+          - name: Set Harbor admin password to the generated value
+            replace:
+              path: /opt/harbor/harbor.yml
+              regexp: '^harbor_admin_password:.*'
+              replace: 'harbor_admin_password: "{{ harbor_admin_password.stdout }}"'
+
+          # Comment out the entire https: block so install.sh doesn't fail on a missing cert.
+          # (HTTP-only registry; enabling TLS is a documented production step.)
+          - name: Comment out the https block header
+            replace:
+              path: /opt/harbor/harbor.yml
+              regexp: '^https:'
+              replace: '#https:'
+
+          - name: Comment out https port 443
+            replace:
+              path: /opt/harbor/harbor.yml
+              regexp: '^(\s*)port: 443'
+              replace: '#\1port: 443'
+
+          - name: Comment out https certificate path
+            replace:
+              path: /opt/harbor/harbor.yml
+              regexp: '^(\s*)certificate:.*'
+              replace: '#\g<0>'
+
+          - name: Comment out https private_key path
+            replace:
+              path: /opt/harbor/harbor.yml
+              regexp: '^(\s*)private_key:.*'
+              replace: '#\g<0>'
+
+          - name: Comment out strong_ssl_ciphers if present
+            replace:
+              path: /opt/harbor/harbor.yml
+              regexp: '^(\s*)strong_ssl_ciphers:.*'
+              replace: '#\g<0>'
+
+          - name: Stage - run Harbor installer (docker load + compose up, several minutes)
+            debug:
+              msg: "Running ./install.sh - this loads bundled images and starts ~9 containers; please wait"
+
+          - name: Run Harbor install.sh (idempotent via docker-compose.yml, long async)
+            command: ./install.sh
+            args:
+              chdir: /opt/harbor
+              creates: /opt/harbor/docker-compose.yml
+            async: 1800
+            poll: 20
+
+          - name: Reload systemd to pick up the staged harbor.service unit
+            systemd:
+              daemon_reload: yes
+
+          - name: Enable and start harbor systemd unit
+            systemd:
+              name: harbor
+              enabled: yes
+              state: started
+
+          - name: Stage - wait for Harbor portal to serve
+            debug:
+              msg: "Polling http://localhost/ until the Harbor portal returns 200 (containers take 1-3 min to become healthy)"
+
+          - name: Wait for Harbor portal (gate on status only, no body)
+            uri:
+              url: http://localhost/
+              status_code: 200
+            register: harbor_portal
+            until: harbor_portal.status == 200
+            retries: 30
+            delay: 10
+
+          - name: Write Harbor credentials/notes file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                Harbor Container Registry
+                Web UI:   http://{{ ansible_default_ipv4.address }}/
+                Login:    admin / {{ harbor_admin_password.stdout }}
+
+                Registry usage:
+                  docker login {{ ansible_default_ipv4.address }}
+                  docker push {{ ansible_default_ipv4.address }}/<project>/<image>
+
+                NOTE: This registry serves over HTTP (not HTTPS). Each Docker client must add
+                "{{ ansible_default_ipv4.address }}" to /etc/docker/daemon.json under
+                "insecure-registries" and restart docker.
+
+                PRODUCTION: enable HTTPS in /opt/harbor/harbor.yml with a real certificate,
+                change the admin password on first login, set a real hostname/domain, and open 443.
+            ignore_errors: yes
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/harbor-24-04/opt/cloudstack/harbor-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/harbor-24-04/opt/cloudstack/harbor-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/harbor-24-04_cleanup.sh && /opt/cloudstack/harbor-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"

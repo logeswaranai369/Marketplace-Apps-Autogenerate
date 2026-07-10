@@ -1,0 +1,16 @@
+[Unit]
+Description=Harbor container registry
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/harbor
+ExecStart=/usr/bin/docker compose -f /opt/harbor/docker-compose.yml up -d
+ExecStop=/usr/bin/docker compose -f /opt/harbor/docker-compose.yml down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
