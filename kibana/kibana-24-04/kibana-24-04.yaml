@@ -1,0 +1,318 @@
+- name: Kibana Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Kibana
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating kibanaadmin_basic_auth_password
+            shell: openssl rand -hex 24
+            register: kibanaadmin_basic_auth_password
+
+          - name: Storing kibanaadmin_basic_auth_password
+            copy:
+              dest: "/root/.kibanaadmin_password"
+              content: |
+                kibanaadmin_basic_auth_password = "{{ kibanaadmin_basic_auth_password.stdout }}"
+          - name: Generating kibana_encrypted_saved_objects_key
+            shell: openssl rand -hex 24
+            register: kibana_encrypted_saved_objects_key
+
+          - name: Storing kibana_encrypted_saved_objects_key
+            copy:
+              dest: "/root/.kibana_encryptedSavedObjects_key"
+              content: |
+                kibana_encrypted_saved_objects_key = "{{ kibana_encrypted_saved_objects_key.stdout }}"
+          - name: Generating kibana_reporting_encryption_key
+            shell: openssl rand -hex 24
+            register: kibana_reporting_encryption_key
+
+          - name: Storing kibana_reporting_encryption_key
+            copy:
+              dest: "/root/.kibana_reporting_key"
+              content: |
+                kibana_reporting_encryption_key = "{{ kibana_reporting_encryption_key.stdout }}"
+          - name: Generating kibana_security_encryption_key
+            shell: openssl rand -hex 24
+            register: kibana_security_encryption_key
+
+          - name: Storing kibana_security_encryption_key
+            copy:
+              dest: "/root/.kibana_security_key"
+              content: |
+                kibana_security_encryption_key = "{{ kibana_security_encryption_key.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Add Elastic 8.x GPG key to keyring
+            shell: curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
+            args:
+              creates: /usr/share/keyrings/elasticsearch-keyring.gpg
+
+          - name: Add Elastic 8.x apt repository
+            apt_repository:
+              repo: "deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main"
+              state: present
+              filename: elastic-8.x
+
+          - name: Install Elasticsearch and Kibana (same run so versions match)
+            apt:
+              name:
+                - elasticsearch
+                - kibana
+              state: latest
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Install nginx and apache2-utils
+            apt:
+              name:
+                - nginx
+                - apache2-utils
+              state: latest
+              lock_timeout: 300
+
+          - name: Bound the Elasticsearch JVM heap
+            copy:
+              dest: /etc/elasticsearch/jvm.options.d/heap.options
+              content: |
+                -Xms512m
+                -Xmx512m
+              owner: root
+              group: elasticsearch
+              mode: '0660'
+
+          - name: Configuring Elasticsearch (authoritative elasticsearch.yml)
+            debug:
+              msg: "Writing a whole authoritative elasticsearch.yml with security disabled (no deb auto-security block)"
+
+          # Overwrite the ENTIRE file in one copy so the deb postinst's
+          # '# BEGIN SECURITY AUTO CONFIGURATION' block cannot survive and create duplicate keys.
+          # Preserve package ownership (root:elasticsearch 0660) so the service can read it.
+          - name: Write authoritative elasticsearch.yml
+            copy:
+              dest: /etc/elasticsearch/elasticsearch.yml
+              content: |
+                cluster.name: kibana-cluster
+                node.name: node-1
+                path.data: /var/lib/elasticsearch
+                path.logs: /var/log/elasticsearch
+                network.host: localhost
+                http.port: 9200
+                discovery.type: single-node
+                xpack.security.enabled: false
+                xpack.security.enrollment.enabled: false
+                xpack.security.http.ssl.enabled: false
+                xpack.security.transport.ssl.enabled: false
+              owner: root
+              group: elasticsearch
+              mode: '0660'
+
+          - name: Configuring Kibana (kibana.yml)
+            debug:
+              msg: "Setting Kibana to connect anonymously to local Elasticsearch and installing encryption keys"
+
+          - name: Set Kibana server.host
+            lineinfile:
+              path: /etc/kibana/kibana.yml
+              regexp: '^#?\s*server\.host:'
+              line: 'server.host: "localhost"'
+              owner: root
+              group: kibana
+              mode: '0660'
+
+          - name: Set Kibana server.port
+            lineinfile:
+              path: /etc/kibana/kibana.yml
+              regexp: '^#?\s*server\.port:'
+              line: 'server.port: 5601'
+              owner: root
+              group: kibana
+              mode: '0660'
+
+          - name: Set Kibana elasticsearch.hosts
+            lineinfile:
+              path: /etc/kibana/kibana.yml
+              regexp: '^#?\s*elasticsearch\.hosts:'
+              line: 'elasticsearch.hosts: ["http://localhost:9200"]'
+              owner: root
+              group: kibana
+              mode: '0660'
+
+          - name: Set Kibana encryptedSavedObjects encryption key
+            lineinfile:
+              path: /etc/kibana/kibana.yml
+              regexp: '^#?\s*xpack\.encryptedSavedObjects\.encryptionKey:'
+              line: 'xpack.encryptedSavedObjects.encryptionKey: "{{ kibana_encrypted_saved_objects_key.stdout }}"'
+              owner: root
+              group: kibana
+              mode: '0660'
+
+          - name: Set Kibana reporting encryption key
+            lineinfile:
+              path: /etc/kibana/kibana.yml
+              regexp: '^#?\s*xpack\.reporting\.encryptionKey:'
+              line: 'xpack.reporting.encryptionKey: "{{ kibana_reporting_encryption_key.stdout }}"'
+              owner: root
+              group: kibana
+              mode: '0660'
+
+          - name: Set Kibana security encryption key
+            lineinfile:
+              path: /etc/kibana/kibana.yml
+              regexp: '^#?\s*xpack\.security\.encryptionKey:'
+              line: 'xpack.security.encryptionKey: "{{ kibana_security_encryption_key.stdout }}"'
+              owner: root
+              group: kibana
+              mode: '0660'
+
+          - name: Configuring nginx reverse proxy
+            debug:
+              msg: "Deploying nginx :80 reverse proxy to Kibana with HTTP basic-auth"
+
+          - name: Create htpasswd file for basic-auth user kibanaadmin
+            command: htpasswd -bBc /etc/nginx/htpasswd.users kibanaadmin '{{ kibanaadmin_basic_auth_password.stdout }}'
+            args:
+              creates: /etc/nginx/htpasswd.users
+
+          - name: Deploy nginx Kibana reverse-proxy vhost
+            copy:
+              dest: /etc/nginx/conf.d/kibana.conf
+              content: |
+                server {
+                    listen 80;
+                    server_name _;
+
+                    auth_basic "Restricted Access";
+                    auth_basic_user_file /etc/nginx/htpasswd.users;
+
+                    location / {
+                        proxy_pass http://localhost:5601;
+                        proxy_http_version 1.1;
+                        proxy_set_header Upgrade $http_upgrade;
+                        proxy_set_header Connection 'upgrade';
+                        proxy_set_header Host $host;
+                        proxy_cache_bypass $http_upgrade;
+                    }
+                }
+              mode: '0644'
+
+          - name: Remove default nginx site
+            file:
+              path: /etc/nginx/sites-enabled/default
+              state: absent
+
+          - name: Starting Elasticsearch first
+            debug:
+              msg: "Enabling and starting Elasticsearch before Kibana (Kibana crash-loops if ES is down)"
+
+          - name: Enable and start Elasticsearch
+            service:
+              name: elasticsearch
+              state: started
+              enabled: yes
+
+          - name: Wait for Elasticsearch to respond on :9200
+            uri:
+              url: http://localhost:9200/
+              status_code: 200
+              return_content: yes
+            register: es_status
+            until: es_status.status == 200 and 'cluster_name' in es_status.content
+            retries: 30
+            delay: 10
+
+          - name: Starting Kibana and nginx
+            debug:
+              msg: "Elasticsearch is up; enabling and starting Kibana and nginx"
+
+          - name: Enable and start Kibana
+            service:
+              name: kibana
+              state: started
+              enabled: yes
+
+          - name: Enable and start nginx
+            service:
+              name: nginx
+              state: restarted
+              enabled: yes
+
+          - name: Allow TCP 80 through ufw (if ufw present/active)
+            ufw:
+              rule: allow
+              port: '80'
+              proto: tcp
+            failed_when: false
+
+          - name: Wait for Kibana to reach 'available' (503 while initializing, then 200)
+            uri:
+              url: http://localhost:5601/api/status
+              status_code: 200
+              return_content: yes
+            register: kb_status
+            until: kb_status.status == 200 and '"level":"available"' in (kb_status.content | regex_replace('\s',''))
+            retries: 40
+            delay: 15
+
+          - name: Ensure /home/ubuntu exists for credentials file
+            file:
+              path: /home/ubuntu
+              state: directory
+              mode: '0755'
+
+          - name: Write credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              content: |
+                Kibana URL:        http://<server-ip>/   (port 80, via nginx)
+                Basic-auth user:   kibanaadmin
+                Basic-auth pass:   {{ kibanaadmin_basic_auth_password.stdout }}
+
+                Elasticsearch:     http://localhost:9200  (local only, security DISABLED)
+                Note: only TCP 80 is exposed. 5601 and 9200 are localhost-bound.
+              owner: root
+              group: root
+              mode: '0600'
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/kibana-24-04/opt/cloudstack/kibana-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/kibana-24-04/opt/cloudstack/kibana-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/kibana-24-04_cleanup.sh && /opt/cloudstack/kibana-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
