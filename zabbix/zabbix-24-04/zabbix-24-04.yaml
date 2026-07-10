@@ -1,0 +1,290 @@
+- name: Zabbix Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Zabbix
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+          - name: Generating zabbix_db_password
+            shell: openssl rand -hex 24
+            register: zabbix_db_password
+
+          - name: Storing zabbix_db_password
+            copy:
+              dest: "/root/.zabbix_db_password"
+              content: |
+                zabbix_db_password = "{{ zabbix_db_password.stdout }}"
+          - name: Generating zabbix_admin_password
+            shell: openssl rand -hex 24
+            register: zabbix_admin_password
+
+          - name: Storing zabbix_admin_password
+            copy:
+              dest: "/root/.zabbix_admin_password"
+              content: |
+                zabbix_admin_password = "{{ zabbix_admin_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Determine Zabbix release repo package URL for this Ubuntu version
+            debug:
+              msg: "Setting up Zabbix 7.0 repository for Ubuntu {{ ansible_distribution_version }}"
+
+          - name: Download Zabbix 7.0 release repository package
+            get_url:
+              url: "https://repo.zabbix.com/zabbix/7.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_7.0-2+ubuntu{{ ansible_distribution_version }}_all.deb"
+              dest: /tmp/zabbix-release.deb
+              mode: '0644'
+
+          - name: Install Zabbix release repository package
+            apt:
+              deb: /tmp/zabbix-release.deb
+              lock_timeout: 300
+
+          - name: Install PyMySQL for Ansible MySQL modules
+            apt:
+              name: python3-pymysql
+              state: latest
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Install web server and MySQL server
+            apt:
+              name:
+                - apache2
+                - mysql-server
+                - apache2-utils
+                - language-pack-en
+              state: latest
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Install Zabbix server, frontend, agent and SQL scripts
+            apt:
+              name:
+                - zabbix-server-mysql
+                - zabbix-frontend-php
+                - zabbix-apache-conf
+                - zabbix-sql-scripts
+                - zabbix-agent
+              state: latest
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Ensure MySQL and Apache are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - mysql
+              - apache2
+
+          # MySQL 8 fresh root uses auth_socket. Gate the password ALTER on the auth PLUGIN (never a
+          # login test, which succeeds via socket regardless) so it's idempotent. After this, root has
+          # NO socket auth, so all DB admin below MUST use login_user + login_password (rule 21).
+          - name: Configure MySQL root authentication (gate on plugin, not a login test)
+            shell: |
+              plugin=$(mysql -N -e "SELECT plugin FROM mysql.user WHERE user='root' AND host='localhost'")
+              if [ "$plugin" != "mysql_native_password" ]; then
+                mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ mysql_root_password.stdout }}'; FLUSH PRIVILEGES;"
+              fi
+            args:
+              executable: /bin/bash
+            register: root_auth
+            changed_when: "'IDENTIFIED' in root_auth.stdout or root_auth.stdout == ''"
+
+          - name: Create Zabbix database with required charset and collation
+            community.mysql.mysql_db:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: zabbix
+              encoding: utf8mb4
+              collation: utf8mb4_bin
+              state: present
+
+          - name: Create Zabbix database user
+            community.mysql.mysql_user:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: zabbix
+              password: "{{ zabbix_db_password.stdout }}"
+              host: localhost
+              priv: "zabbix.*:ALL"
+              state: present
+
+          - name: Check whether Zabbix schema is already imported
+            shell: mysql -u root -p'{{ mysql_root_password.stdout }}' -N -e "SHOW TABLES LIKE 'users'" zabbix
+            register: zbx_schema
+            changed_when: false
+            failed_when: false
+
+          - name: Import Zabbix schema (with log_bin_trust_function_creators enabled for the import)
+            shell: |
+              set -e
+              mysql -u root -p'{{ mysql_root_password.stdout }}' -e "SET GLOBAL log_bin_trust_function_creators = 1;"
+              zcat /usr/share/zabbix-sql-scripts/mysql/server.sql.gz | mysql --default-character-set=utf8mb4 -u zabbix -p'{{ zabbix_db_password.stdout }}' zabbix
+              mysql -u root -p'{{ mysql_root_password.stdout }}' -e "SET GLOBAL log_bin_trust_function_creators = 0;"
+            args:
+              executable: /bin/bash
+            when: "'users' not in zbx_schema.stdout"
+
+          - name: Pre-seed the Zabbix Admin password (bcrypt hash in DB)
+            shell: |
+              hash=$(htpasswd -nbBC 10 Admin '{{ zabbix_admin_password.stdout }}' | cut -d: -f2)
+              mysql -u root -p'{{ mysql_root_password.stdout }}' -e "UPDATE zabbix.users SET passwd='$hash' WHERE username='Admin';"
+            args:
+              executable: /bin/bash
+
+          - name: Configure Zabbix server database password
+            lineinfile:
+              path: /etc/zabbix/zabbix_server.conf
+              regexp: '^#?\s*DBPassword='
+              line: "DBPassword={{ zabbix_db_password.stdout }}"
+              state: present
+
+          - name: Ensure Zabbix frontend config directory exists
+            file:
+              path: /etc/zabbix/web
+              state: directory
+              owner: www-data
+              group: www-data
+              mode: '0755'
+
+          # Pre-seed zabbix.conf.php INLINE so the frontend serves the real app instead of the
+          # interactive setup wizard. Holds the runtime-generated DB password -> must be written here,
+          # never staged as a static file.
+          - name: Pre-seed Zabbix frontend configuration (skip the setup wizard)
+            copy:
+              dest: /etc/zabbix/web/zabbix.conf.php
+              owner: www-data
+              group: www-data
+              mode: '0640'
+              content: |
+                <?php
+                // Zabbix GUI configuration file.
+                $DB['TYPE']                     = 'MYSQL';
+                $DB['SERVER']                   = 'localhost';
+                $DB['PORT']                     = '0';
+                $DB['DATABASE']                 = 'zabbix';
+                $DB['USER']                     = 'zabbix';
+                $DB['PASSWORD']                 = '{{ zabbix_db_password.stdout }}';
+                $DB['SCHEMA']                   = '';
+                $DB['ENCRYPTION']               = false;
+                $DB['VERIFY_HOST']              = false;
+                $DB['KEY_FILE']                 = '';
+                $DB['CERT_FILE']                = '';
+                $DB['CA_FILE']                  = '';
+                $DB['CIPHER_LIST']              = '';
+                $DB['DOUBLE_IEEE754']           = true;
+                $ZBX_SERVER                     = 'localhost';
+                $ZBX_SERVER_PORT                = '10051';
+                $ZBX_SERVER_NAME                = 'Zabbix';
+                $IMAGE_FORMAT_DEFAULT           = IMAGE_FORMAT_PNG;
+
+          - name: Set PHP date.timezone in the Zabbix Apache configuration
+            replace:
+              path: /etc/apache2/conf-enabled/zabbix.conf
+              regexp: '#\s*(php_value|php_admin_value)\s+date\.timezone\s+.*'
+              replace: '\1 date.timezone UTC'
+
+          # Serve the frontend at / (health check hits http://localhost/). DocumentRoot points at the
+          # exact package frontend path; the Directory php handling from zabbix.conf applies here too.
+          - name: Deploy Apache virtual host serving the Zabbix frontend at root
+            copy:
+              dest: /etc/apache2/sites-available/zabbix-frontend.conf
+              mode: '0644'
+              content: |
+                <VirtualHost *:80>
+                    ServerName _default_
+                    DocumentRoot /usr/share/zabbix
+                    <Directory /usr/share/zabbix>
+                        Options FollowSymLinks
+                        AllowOverride None
+                        Require all granted
+                        DirectoryIndex index.php
+                    </Directory>
+                </VirtualHost>
+
+          - name: Enable Zabbix frontend site and disable the default site
+            command: "{{ item }}"
+            loop:
+              - a2ensite zabbix-frontend
+              - a2dissite 000-default
+            ignore_errors: yes
+
+          - name: Reload Apache to apply frontend configuration
+            service:
+              name: apache2
+              state: reloaded
+
+          - name: Enable and (re)start Zabbix services
+            service:
+              name: "{{ item }}"
+              state: restarted
+              enabled: yes
+            loop:
+              - zabbix-server
+              - zabbix-agent
+              - apache2
+
+          - name: Wait for the Zabbix frontend to serve the login page (not the setup wizard)
+            uri:
+              url: http://localhost/index.php
+              return_content: yes
+              status_code: 200
+            register: zbx_front
+            until: zbx_front.status == 200 and 'Zabbix' in zbx_front.get('content','')
+            retries: 20
+            delay: 10
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/zabbix-24-04/opt/cloudstack/zabbix-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/zabbix-24-04/opt/cloudstack/zabbix-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/zabbix-24-04_cleanup.sh && /opt/cloudstack/zabbix-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
