@@ -1,0 +1,176 @@
+- name: RabbitMQ Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure RabbitMQ
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating rabbitmq_admin_password
+            shell: openssl rand -hex 24
+            register: rabbitmq_admin_password
+
+          - name: Storing rabbitmq_admin_password
+            copy:
+              dest: "/root/.rabbitmq_admin_password"
+              content: |
+                rabbitmq_admin_password = "{{ rabbitmq_admin_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install RabbitMQ server (pulls compatible Erlang automatically)
+            debug:
+              msg: "Installing rabbitmq-server from the stock Ubuntu repository (no external repos)"
+
+          - name: Install rabbitmq-server package
+            apt:
+              name: rabbitmq-server
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure rabbitmq-server is enabled and running
+            service:
+              name: rabbitmq-server
+              state: started
+              enabled: yes
+
+          - name: Enable the RabbitMQ management plugin (UI + HTTP API on 15672)
+            debug:
+              msg: "Enabling rabbitmq_management plugin"
+
+          - name: Enable rabbitmq_management plugin (idempotent)
+            command: rabbitmq-plugins enable rabbitmq_management
+            register: mgmt_plugin
+            changed_when: "'set 5 plugins' not in mgmt_plugin.stdout and 'already enabled' not in mgmt_plugin.stdout"
+
+          - name: Restart rabbitmq-server to apply plugin
+            service:
+              name: rabbitmq-server
+              state: restarted
+
+          - name: Wait for RabbitMQ node to be fully up
+            command: rabbitmqctl await_startup
+            changed_when: false
+            register: await_result
+            retries: 10
+            delay: 6
+            until: await_result.rc == 0
+
+          - name: Configure administrative user and secure defaults
+            debug:
+              msg: "Creating admin user, setting permissions, deleting the default guest user"
+
+          - name: Get current list of RabbitMQ users
+            command: rabbitmqctl list_users
+            register: rabbit_users
+            changed_when: false
+
+          # Create the admin user only if it doesn't already exist (add_user errors if it exists).
+          - name: Create admin user
+            command: rabbitmqctl add_user admin '{{ rabbitmq_admin_password.stdout }}'
+            when: "'admin\t' not in rabbit_users.stdout"
+
+          # Re-assert the password on a re-run so the stored/known password is always the live one.
+          - name: Ensure admin password is set to the generated value
+            command: rabbitmqctl change_password admin '{{ rabbitmq_admin_password.stdout }}'
+            when: "'admin\t' in rabbit_users.stdout"
+
+          - name: Tag admin user as administrator
+            command: rabbitmqctl set_user_tags admin administrator
+
+          - name: Grant admin full permissions on the default vhost
+            command: rabbitmqctl set_permissions -p / admin ".*" ".*" ".*"
+
+          # delete_user guest errors if guest is already gone — gate on the current user list.
+          - name: Delete the default guest user
+            command: rabbitmqctl delete_user guest
+            when: "'guest\t' in rabbit_users.stdout"
+
+          - name: Verify RabbitMQ node status (sanity, non-failing)
+            command: rabbitmq-diagnostics check_running
+            register: diag_running
+            changed_when: false
+            failed_when: false
+
+          - name: Verify the management UI is serving (unauthenticated 200)
+            debug:
+              msg: "Waiting for the management UI on port 15672 to return 200"
+
+          - name: Wait for management UI root to return 200
+            uri:
+              url: http://localhost:15672/
+              status_code: 200
+            register: mgmt_ui
+            retries: 10
+            delay: 6
+            until: mgmt_ui.status == 200
+
+          - name: Verify authenticated management HTTP API (api/overview)
+            uri:
+              url: http://localhost:15672/api/overview
+              url_username: admin
+              url_password: "{{ rabbitmq_admin_password.stdout }}"
+              force_basic_auth: yes
+              status_code: 200
+            register: api_overview
+            retries: 10
+            delay: 6
+            until: api_overview.status == 200
+
+          - name: Write credentials file for the operator
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                RabbitMQ Marketplace Deployment
+                Management UI : http://<server-ip>:15672/  (login with the admin user below)
+                AMQP endpoint : amqp://<server-ip>:5672/
+
+                Admin user     : admin
+                Admin password : {{ rabbitmq_admin_password.stdout }}
+
+                NOTE: the default 'guest' user has been DELETED.
+                FIREWALL: open 5672 (AMQP) and 15672 (management UI) as needed.
+                          Lock 15672 down to trusted IPs since it is an admin console.
+            ignore_errors: yes
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/rabbitmq-24-04/opt/cloudstack/rabbitmq-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/rabbitmq-24-04/opt/cloudstack/rabbitmq-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/rabbitmq-24-04_cleanup.sh && /opt/cloudstack/rabbitmq-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
