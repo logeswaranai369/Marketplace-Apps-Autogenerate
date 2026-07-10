@@ -1,0 +1,141 @@
+- name: Docker Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Docker
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install Docker prerequisite packages
+            apt:
+              name:
+                - ca-certificates
+                - curl
+                - gnupg
+              state: latest
+              lock_timeout: 300
+
+          - name: Create apt keyrings directory
+            file:
+              path: /etc/apt/keyrings
+              state: directory
+              mode: '0755'
+
+          - name: Add Docker official GPG key (dearmored keyring)
+            shell: |
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              chmod a+r /etc/apt/keyrings/docker.gpg
+            args:
+              creates: /etc/apt/keyrings/docker.gpg
+
+          - name: Add Docker apt repository (resolve codename at runtime)
+            shell: |
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release; echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+            args:
+              creates: /etc/apt/sources.list.d/docker.list
+
+          - name: Update apt cache after adding Docker repo
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Install Docker Engine and Compose v2
+            apt:
+              name:
+                - docker-ce
+                - docker-ce-cli
+                - containerd.io
+                - docker-buildx-plugin
+                - docker-compose-plugin
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure Docker service is enabled and started
+            service:
+              name: docker
+              state: started
+              enabled: yes
+
+          - name: Add the ubuntu user to the docker group (takes effect on next login)
+            user:
+              name: ubuntu
+              groups: docker
+              append: yes
+            ignore_errors: yes
+
+          - name: Wait for the Docker daemon socket to be ready
+            command: docker info
+            register: dinfo
+            changed_when: false
+            retries: 10
+            delay: 6
+            until: dinfo.rc == 0
+
+          - name: End-to-end functional proof (docker run hello-world)
+            command: docker run --rm hello-world
+            register: hw
+            changed_when: false
+
+          - name: Show hello-world result
+            debug:
+              msg: "Docker hello-world completed (rc={{ hw.rc }})"
+
+          - name: Write usage note (no credentials for Docker)
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0644'
+              content: |
+                Docker Engine (Docker CE) + Compose v2 installed from Docker's official apt repo.
+                There is no web UI and no login/password.
+
+                Test the engine:      docker run hello-world
+                Check Compose v2:     docker compose version
+
+                The 'ubuntu' user was added to the 'docker' group — re-login for it to take
+                effect (then docker runs without sudo).
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/docker-24-04/opt/cloudstack/docker-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/docker-24-04/opt/cloudstack/docker-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/docker-24-04_cleanup.sh && /opt/cloudstack/docker-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
