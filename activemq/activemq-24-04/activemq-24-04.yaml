@@ -1,0 +1,186 @@
+- name: ActiveMQ Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure ActiveMQ
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating activemq_admin_password
+            shell: openssl rand -hex 24
+            register: activemq_admin_password
+
+          - name: Storing activemq_admin_password
+            copy:
+              dest: "/root/.activemq_admin_password"
+              content: |
+                activemq_admin_password = "{{ activemq_admin_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/activemq-24-04/etc/systemd/system/activemq.service', confdest: '/etc/systemd/system/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install Java (default-jdk) required by the ActiveMQ broker
+            apt:
+              name:
+                - default-jdk
+              state: latest
+              lock_timeout: 300
+
+          - name: Download Apache ActiveMQ 5.19.8 tarball from the permanent archive
+            get_url:
+              url: https://archive.apache.org/dist/activemq/5.19.8/apache-activemq-5.19.8-bin.tar.gz
+              dest: /tmp/apache-activemq-5.19.8-bin.tar.gz
+              mode: '0644'
+
+          - name: Extract ActiveMQ into /opt (idempotent)
+            unarchive:
+              src: /tmp/apache-activemq-5.19.8-bin.tar.gz
+              dest: /opt
+              remote_src: yes
+              creates: /opt/apache-activemq-5.19.8
+
+          - name: Symlink /opt/activemq to the versioned directory
+            file:
+              src: /opt/apache-activemq-5.19.8
+              dest: /opt/activemq
+              state: link
+
+          - name: Create the activemq system group
+            group:
+              name: activemq
+              system: yes
+
+          - name: Create the activemq system user (nologin, no home)
+            user:
+              name: activemq
+              group: activemq
+              system: yes
+              shell: /usr/sbin/nologin
+              create_home: no
+
+          - name: Ensure the ActiveMQ install dir is owned by activemq
+            file:
+              path: /opt/apache-activemq-5.19.8
+              owner: activemq
+              group: activemq
+              recurse: yes
+
+          - name: Set the web console admin credentials (remove admin/admin default)
+            lineinfile:
+              path: /opt/apache-activemq-5.19.8/conf/jetty-realm.properties
+              regexp: '^\s*admin\s*:'
+              line: "admin: {{ activemq_admin_password.stdout }}, admin"
+              owner: activemq
+              group: activemq
+
+          - name: Disable the default 'user' console account
+            lineinfile:
+              path: /opt/apache-activemq-5.19.8/conf/jetty-realm.properties
+              regexp: '^\s*user\s*:'
+              state: absent
+              owner: activemq
+              group: activemq
+
+          - name: Bind the Jetty web console to all interfaces (0.0.0.0)
+            replace:
+              path: /opt/apache-activemq-5.19.8/conf/jetty.xml
+              regexp: 'property="jetty\.host"\s+default="127\.0\.0\.1"'
+              replace: 'property="jetty.host" default="0.0.0.0"'
+              owner: activemq
+              group: activemq
+
+          - name: Reload systemd so it picks up the ActiveMQ unit
+            systemd:
+              daemon_reload: yes
+
+          - name: Enable and start the ActiveMQ service
+            service:
+              name: activemq
+              state: started
+              enabled: yes
+
+          - name: Wait for the OpenWire broker port (61616) to be listening
+            wait_for:
+              port: 61616
+              host: 127.0.0.1
+              timeout: 120
+
+          - name: Wait for the Jetty web console socket (8161) to be listening
+            wait_for:
+              port: 8161
+              host: 127.0.0.1
+              timeout: 120
+
+          - name: Verify the authenticated web console returns 200 (JVM warmup ~20-60s)
+            uri:
+              url: http://localhost:8161/admin/
+              url_username: admin
+              url_password: "{{ activemq_admin_password.stdout }}"
+              force_basic_auth: yes
+              status_code: 200
+            register: console_check
+            until: console_check.status == 200
+            retries: 20
+            delay: 6
+
+          - name: Write operator credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+              content: |
+                Apache ActiveMQ 5.19.8
+                Web console: http://<server-ip>:8161/admin/
+                  login: admin
+                  password: {{ activemq_admin_password.stdout }}
+
+                OpenWire:    tcp://<server-ip>:61616
+
+                Note: the default 'user' console account was removed.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/activemq-24-04/opt/cloudstack/activemq-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/activemq-24-04/opt/cloudstack/activemq-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/activemq-24-04_cleanup.sh && /opt/cloudstack/activemq-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"

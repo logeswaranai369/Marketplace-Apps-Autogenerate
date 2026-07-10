@@ -1,0 +1,14 @@
+[Unit]
+Description=Apache ActiveMQ
+After=network.target
+
+[Service]
+Type=simple
+User=activemq
+Group=activemq
+ExecStart=/opt/activemq/bin/activemq console
+Restart=on-failure
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
