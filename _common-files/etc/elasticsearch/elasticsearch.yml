@@ -1,17 +1,10 @@
-# ======================== Elasticsearch Configuration =========================
-cluster.name: kibana-all-in-one
+cluster.name: kibana-allinone
 node.name: node-1
 path.data: /var/lib/elasticsearch
 path.logs: /var/log/elasticsearch
-
-# Bind to localhost only; Kibana is the sole client and ES must NOT be exposed.
 network.host: localhost
 http.port: 9200
-
-# Single-node bootstrap.
 discovery.type: single-node
-
-# Security fully disabled (nginx basic-auth is the only access control on this image).
 xpack.security.enabled: false
 xpack.security.enrollment.enabled: false
 xpack.security.http.ssl.enabled: false

@@ -12,8 +12,8 @@ ${NC}"
 echo
 echo -e "${RED}This message will be removed in the next login!${NC}"
 echo
-echo -e "${RED}Credential: kibanaadmin_password (stored at /root/.kibanaadmin_password)${NC}"
-cat /root/.kibanaadmin_password
+echo -e "${RED}Credential: kibanaadmin_basic_auth_password (stored at /root/.kibanaadmin_basic_auth_password)${NC}"
+cat /root/.kibanaadmin_basic_auth_password
 echo
 echo -e "${RED}Credential: kibana_encrypted_saved_objects_key (stored at /root/.kibana_encrypted_saved_objects_key)${NC}"
 cat /root/.kibana_encrypted_saved_objects_key

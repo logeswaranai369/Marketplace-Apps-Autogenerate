@@ -1,6 +1,3 @@
-# ======================== Kibana Configuration =========================
-server.host: "localhost"
 server.port: 5601
-
-# ES security is disabled, so Kibana connects anonymously (no username/password).
+server.host: "localhost"
 elasticsearch.hosts: ["http://localhost:9200"]
