@@ -1,0 +1,13 @@
+[Unit]
+Description=GenieACS UI
+After=network.target mongod.service
+Requires=mongod.service
+
+[Service]
+User=genieacs
+EnvironmentFile=/opt/genieacs/genieacs.env
+ExecStart=/usr/bin/genieacs-ui
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,242 @@
+- name: GenieACS Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure GenieACS
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating genieacs_ui_jwt_secret
+            shell: openssl rand -hex 24
+            register: genieacs_ui_jwt_secret
+
+          - name: Storing genieacs_ui_jwt_secret
+            copy:
+              dest: "/root/.genieacs_ui_jwt_secret"
+              content: |
+                genieacs_ui_jwt_secret = "{{ genieacs_ui_jwt_secret.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/genieacs-24-04/etc/systemd/system/genieacs-cwmp.service', confdest: '/etc/systemd/system/'}
+              - { confsrc: '/usr/local/src/genieacs-24-04/etc/systemd/system/genieacs-nbi.service', confdest: '/etc/systemd/system/'}
+              - { confsrc: '/usr/local/src/genieacs-24-04/etc/systemd/system/genieacs-fs.service', confdest: '/etc/systemd/system/'}
+              - { confsrc: '/usr/local/src/genieacs-24-04/etc/systemd/system/genieacs-ui.service', confdest: '/etc/systemd/system/'}
+              - { confsrc: '/usr/local/src/genieacs-24-04/etc/logrotate.d/genieacs', confdest: '/etc/logrotate.d/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages for repository setup
+            apt:
+              name:
+                - ca-certificates
+                - curl
+                - gnupg
+                - apt-transport-https
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure keyrings directory exists
+            file:
+              path: /usr/share/keyrings
+              state: directory
+              mode: '0755'
+
+          - name: Setting up NodeSource and MongoDB repositories
+            debug:
+              msg: "Configuring NodeSource (Node 20.x) and MongoDB 8.0 apt repositories for {{ ansible_distribution_release }}"
+
+          - name: Download NodeSource GPG key
+            get_url:
+              url: https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+              dest: /tmp/nodesource.gpg.key
+              mode: '0644'
+
+          - name: Install NodeSource GPG keyring (dearmored)
+            shell: gpg --batch --yes --dearmor -o /usr/share/keyrings/nodesource.gpg /tmp/nodesource.gpg.key
+            args:
+              creates: /usr/share/keyrings/nodesource.gpg
+
+          - name: Add NodeSource 20.x repository
+            apt_repository:
+              repo: "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main"
+              filename: nodesource
+              state: present
+
+          - name: Download MongoDB 8.0 GPG key
+            get_url:
+              url: https://pgp.mongodb.com/server-8.0.asc
+              dest: /tmp/mongodb-server-8.0.asc
+              mode: '0644'
+
+          - name: Install MongoDB GPG keyring (dearmored)
+            shell: gpg --batch --yes --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg /tmp/mongodb-server-8.0.asc
+            args:
+              creates: /usr/share/keyrings/mongodb-server-8.0.gpg
+
+          - name: Add MongoDB 8.0 repository (codename adapts per Ubuntu release)
+            apt_repository:
+              repo: "deb [ signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu {{ ansible_distribution_release }}/mongodb-org/8.0 multiverse"
+              filename: mongodb-org-8.0
+              state: present
+
+          - name: Installing Node.js
+            debug:
+              msg: "Installing Node.js 20.x from NodeSource"
+
+          - name: Install Node.js
+            apt:
+              name: nodejs
+              state: latest
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Installing MongoDB
+            debug:
+              msg: "Installing MongoDB 8.0 server"
+
+          - name: Install MongoDB
+            apt:
+              name: mongodb-org
+              state: latest
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Enable and start MongoDB
+            service:
+              name: mongod
+              state: started
+              enabled: yes
+
+          - name: Wait for MongoDB to accept connections on 27017
+            wait_for:
+              host: 127.0.0.1
+              port: 27017
+              delay: 2
+              timeout: 90
+
+          - name: Installing GenieACS
+            debug:
+              msg: "Installing genieacs@{{ '1.2.16' }} via npm (global)"
+
+          - name: Check if GenieACS is already installed
+            stat:
+              path: /usr/bin/genieacs-cwmp
+            register: genieacs_installed
+
+          - name: Install GenieACS globally via npm
+            command: npm install -g genieacs@1.2.16
+            when: not genieacs_installed.stat.exists
+
+          - name: Configuring GenieACS service user and directories
+            debug:
+              msg: "Creating genieacs system user and required directories"
+
+          - name: Create genieacs system group
+            group:
+              name: genieacs
+              system: yes
+
+          - name: Create genieacs system user (no home, no login)
+            user:
+              name: genieacs
+              group: genieacs
+              system: yes
+              create_home: no
+              shell: /usr/sbin/nologin
+
+          - name: Create GenieACS directories
+            file:
+              path: "{{ item }}"
+              state: directory
+              owner: genieacs
+              group: genieacs
+              mode: '0755'
+            loop:
+              - /opt/genieacs
+              - /opt/genieacs/ext
+              - /var/log/genieacs
+
+          - name: Writing GenieACS environment file with JWT secret
+            debug:
+              msg: "Writing /opt/genieacs/genieacs.env (contains the required GENIEACS_UI_JWT_SECRET)"
+
+          # The JWT secret is written inline with the in-play generated value (never staged as static
+          # config). Without GENIEACS_UI_JWT_SECRET the UI will not function.
+          - name: Write GenieACS environment file (inline, real secret value)
+            copy:
+              dest: /opt/genieacs/genieacs.env
+              owner: genieacs
+              group: genieacs
+              mode: '0600'
+              content: |
+                GENIEACS_CWMP_ACCESS_LOG_FILE=/var/log/genieacs/genieacs-cwmp-access.log
+                GENIEACS_NBI_ACCESS_LOG_FILE=/var/log/genieacs/genieacs-nbi-access.log
+                GENIEACS_FS_ACCESS_LOG_FILE=/var/log/genieacs/genieacs-fs-access.log
+                GENIEACS_UI_ACCESS_LOG_FILE=/var/log/genieacs/genieacs-ui-access.log
+                GENIEACS_DEBUG_FILE=/var/log/genieacs/debug.yaml
+                GENIEACS_EXT_DIR=/opt/genieacs/ext
+                GENIEACS_UI_JWT_SECRET={{ genieacs_ui_jwt_secret.stdout }}
+                NODE_OPTIONS=--enable-source-maps
+
+          - name: Reload systemd to pick up GenieACS unit files
+            systemd:
+              daemon_reload: yes
+
+          - name: Enabling and starting GenieACS daemons
+            debug:
+              msg: "Enabling and starting genieacs-cwmp, genieacs-nbi, genieacs-fs, genieacs-ui"
+
+          - name: Enable and start all GenieACS services
+            service:
+              name: "{{ item }}"
+              state: restarted
+              enabled: yes
+            loop:
+              - genieacs-cwmp
+              - genieacs-nbi
+              - genieacs-fs
+              - genieacs-ui
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/genieacs-24-04/opt/cloudstack/genieacs-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/genieacs-24-04/opt/cloudstack/genieacs-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/genieacs-24-04_cleanup.sh && /opt/cloudstack/genieacs-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"

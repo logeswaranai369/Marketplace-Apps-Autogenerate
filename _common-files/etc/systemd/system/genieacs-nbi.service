@@ -1,0 +1,13 @@
+[Unit]
+Description=GenieACS NBI
+After=network.target mongod.service
+Requires=mongod.service
+
+[Service]
+User=genieacs
+EnvironmentFile=/opt/genieacs/genieacs.env
+ExecStart=/usr/bin/genieacs-nbi
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

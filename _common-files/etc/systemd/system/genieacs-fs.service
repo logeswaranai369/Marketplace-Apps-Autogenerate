@@ -1,0 +1,13 @@
+[Unit]
+Description=GenieACS FS
+After=network.target mongod.service
+Requires=mongod.service
+
+[Service]
+User=genieacs
+EnvironmentFile=/opt/genieacs/genieacs.env
+ExecStart=/usr/bin/genieacs-fs
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+/var/log/genieacs/*.log /var/log/genieacs/*.yaml {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 genieacs genieacs
+    sharedscripts
+    postrotate
+        systemctl kill -s HUP genieacs-cwmp.service genieacs-nbi.service genieacs-fs.service genieacs-ui.service 2>/dev/null || true
+    endscript
+}
