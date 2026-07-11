@@ -1,0 +1,151 @@
+- name: Zabbix Proxy Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Zabbix Proxy
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Zabbix Proxy - configure upstream repository
+            debug:
+              msg: "Setting up Zabbix 7.0 LTS repository for Ubuntu {{ ansible_distribution_version }}"
+
+          - name: Download zabbix-release package for the running Ubuntu version
+            get_url:
+              url: "https://repo.zabbix.com/zabbix/7.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_7.0-2+ubuntu{{ ansible_distribution_version }}_all.deb"
+              dest: /tmp/zabbix-release.deb
+              mode: '0644'
+
+          - name: Install zabbix-release repository package
+            apt:
+              deb: /tmp/zabbix-release.deb
+              state: present
+              lock_timeout: 300
+
+          - name: Update apt cache after adding Zabbix repo
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Install Zabbix Proxy (SQLite flavor)
+            debug:
+              msg: "Installing zabbix-proxy-sqlite3 package"
+
+          - name: Install zabbix-proxy-sqlite3
+            apt:
+              name: zabbix-proxy-sqlite3
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure Zabbix data directory exists and is owned by zabbix
+            file:
+              path: /var/lib/zabbix
+              state: directory
+              owner: zabbix
+              group: zabbix
+              mode: '0755'
+
+          - name: Configure zabbix_proxy.conf
+            debug:
+              msg: "Applying /etc/zabbix/zabbix_proxy.conf settings (edit in place)"
+
+          - name: Set Server (central Zabbix server this proxy reports to; change post-deploy)
+            lineinfile:
+              path: /etc/zabbix/zabbix_proxy.conf
+              regexp: '^\s*#?\s*Server='
+              line: 'Server=127.0.0.1'
+              owner: root
+              group: root
+              mode: '0644'
+
+          - name: Set proxy Hostname (must match the proxy name registered in the Zabbix server UI)
+            lineinfile:
+              path: /etc/zabbix/zabbix_proxy.conf
+              regexp: '^\s*#?\s*Hostname='
+              line: 'Hostname=zabbix-proxy'
+              owner: root
+              group: root
+              mode: '0644'
+
+          - name: Set DBName to an absolute, writable SQLite file path
+            lineinfile:
+              path: /etc/zabbix/zabbix_proxy.conf
+              regexp: '^\s*#?\s*DBName='
+              line: 'DBName=/var/lib/zabbix/zabbix_proxy.db'
+              owner: root
+              group: root
+              mode: '0644'
+
+          - name: Enable and start zabbix-proxy (auto-creates SQLite schema on first start)
+            debug:
+              msg: "Enabling and starting zabbix-proxy service"
+
+          - name: Ensure zabbix-proxy is enabled and running
+            service:
+              name: zabbix-proxy
+              state: started
+              enabled: yes
+
+          - name: Wait for Zabbix proxy listener on TCP 10051 (proves schema init + startup)
+            wait_for:
+              port: 10051
+              host: 127.0.0.1
+              timeout: 60
+
+          - name: Confirm proxy startup in the log (informational only)
+            shell: "grep -q 'proxy #0 started' /var/log/zabbix/zabbix_proxy.log"
+            register: zbx_proxy_log
+            failed_when: false
+            changed_when: false
+
+          - name: Zabbix Proxy install complete
+            debug:
+              msg: >
+                Zabbix Proxy (SQLite) is running on TCP 10051.
+                POST-DEPLOY: edit /etc/zabbix/zabbix_proxy.conf to set Server=<your Zabbix server IP>
+                and Hostname=<unique proxy name>, then run 'systemctl restart zabbix-proxy', and add a
+                matching Proxy in the Zabbix server UI (Administration -> Proxies).
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/zabbix-proxy-24-04/opt/cloudstack/zabbix-proxy-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/zabbix-proxy-24-04/opt/cloudstack/zabbix-proxy-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/zabbix-proxy-24-04_cleanup.sh && /opt/cloudstack/zabbix-proxy-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
