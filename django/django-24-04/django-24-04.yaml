@@ -1,0 +1,251 @@
+- name: Django Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Django
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating django_secret_key
+            shell: openssl rand -hex 24
+            register: django_secret_key
+
+          - name: Storing django_secret_key
+            copy:
+              dest: "/root/.django_secret_key"
+              content: |
+                django_secret_key = "{{ django_secret_key.stdout }}"
+          - name: Generating django_db_password
+            shell: openssl rand -hex 24
+            register: django_db_password
+
+          - name: Storing django_db_password
+            copy:
+              dest: "/root/.django_db_password"
+              content: |
+                django_db_password = "{{ django_db_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/django-24-04/etc/systemd/system/gunicorn.service', confdest: '/etc/systemd/system/'}
+              - { confsrc: '/usr/local/src/django-24-04/etc/nginx/sites-available/django.conf', confdest: '/etc/nginx/sites-available/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install nginx web server
+            apt:
+              name:
+                - nginx
+              state: latest
+              lock_timeout: 300
+
+          - name: Install Python build toolchain and PostgreSQL client headers
+            apt:
+              name:
+                - python3
+                - python3-venv
+                - python3-dev
+                - libpq-dev
+                - build-essential
+              state: latest
+              lock_timeout: 300
+
+          - name: Install PostgreSQL server
+            apt:
+              name:
+                - postgresql
+                - postgresql-contrib
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure PostgreSQL and nginx are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - postgresql
+              - nginx
+
+          - name: Set up PostgreSQL database and user
+            debug:
+              msg: "Creating PostgreSQL database 'django' and application role"
+
+          # Admin over peer auth as the postgres OS user; no login_password needed.
+          # Idempotent guards so re-runs do not error on existing db/role.
+          - name: Create database, role and grants for Django
+            shell: |
+              set -e
+              sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='django'" | grep -q 1 \
+                || sudo -u postgres psql -c "CREATE DATABASE django;"
+              sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='django'" | grep -q 1 \
+                || sudo -u postgres psql -c "CREATE USER django WITH PASSWORD '{{ django_db_password.stdout }}';"
+              sudo -u postgres psql -c "ALTER USER django WITH PASSWORD '{{ django_db_password.stdout }}';"
+              sudo -u postgres psql -c "ALTER ROLE django SET client_encoding TO 'utf8';"
+              sudo -u postgres psql -c "ALTER ROLE django SET default_transaction_isolation TO 'read committed';"
+              sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE django TO django;"
+              sudo -u postgres psql -d django -c "GRANT ALL ON SCHEMA public TO django;"
+            args:
+              executable: /bin/bash
+
+          - name: Create Python virtualenv and install Django
+            debug:
+              msg: "Creating virtualenv at /opt/django/venv and installing Django==5.2 + gunicorn"
+
+          - name: Ensure /opt/django directory exists
+            file:
+              path: /opt/django
+              state: directory
+              mode: '0755'
+
+          - name: Create the virtualenv
+            command: python3 -m venv /opt/django/venv
+            args:
+              creates: /opt/django/venv/bin/python
+
+          - name: Upgrade pip inside the venv
+            command: /opt/django/venv/bin/pip install --upgrade pip
+            changed_when: false
+
+          - name: Install Django, gunicorn and psycopg2 into the venv
+            command: /opt/django/venv/bin/pip install "Django==5.2" gunicorn psycopg2-binary
+            args:
+              creates: /opt/django/venv/bin/gunicorn
+
+          - name: Create the Django project
+            debug:
+              msg: "Bootstrapping Django project at /opt/django/project"
+
+          - name: Ensure project directory exists
+            file:
+              path: /opt/django/project
+              state: directory
+              mode: '0755'
+
+          - name: Start a new Django project (guarded)
+            command: /opt/django/venv/bin/django-admin startproject config /opt/django/project
+            args:
+              creates: /opt/django/project/manage.py
+
+          - name: Configure Django settings for production
+            debug:
+              msg: "Writing production settings (SECRET_KEY, DEBUG=False, ALLOWED_HOSTS, PostgreSQL, STATIC_ROOT)"
+
+          # settings.py holds generated secrets so it is edited in place (never staged).
+          # Appended overrides win because settings.py executes top-to-bottom.
+          - name: Append production settings overrides
+            blockinfile:
+              path: /opt/django/project/config/settings.py
+              marker: "# {mark} MARKGEN PRODUCTION SETTINGS"
+              block: |
+                SECRET_KEY = '{{ django_secret_key.stdout }}'
+                DEBUG = False
+                ALLOWED_HOSTS = ['*']
+                DATABASES = {
+                    'default': {
+                        'ENGINE': 'django.db.backends.postgresql',
+                        'NAME': 'django',
+                        'USER': 'django',
+                        'PASSWORD': '{{ django_db_password.stdout }}',
+                        'HOST': '127.0.0.1',
+                        'PORT': '5432',
+                    }
+                }
+                STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+          - name: Set ownership of project and venv to www-data
+            command: chown -R www-data:www-data /opt/django
+            changed_when: false
+
+          - name: Run database migrations and collect static files
+            debug:
+              msg: "Running migrate and collectstatic as www-data"
+
+          - name: Apply database migrations
+            shell: sudo -u www-data /opt/django/venv/bin/python /opt/django/project/manage.py migrate --noinput
+            args:
+              executable: /bin/bash
+
+          - name: Collect static files
+            shell: sudo -u www-data /opt/django/venv/bin/python /opt/django/project/manage.py collectstatic --noinput
+            args:
+              executable: /bin/bash
+
+          - name: Enable and start gunicorn
+            debug:
+              msg: "Reloading systemd and starting gunicorn (must be up before nginx)"
+
+          - name: Reload systemd and start gunicorn
+            systemd:
+              name: gunicorn
+              daemon_reload: yes
+              state: restarted
+              enabled: yes
+
+          - name: Configure and reload nginx reverse proxy
+            debug:
+              msg: "Enabling django.conf vhost and disabling the default site"
+
+          - name: Remove default nginx site
+            file:
+              path: /etc/nginx/sites-enabled/default
+              state: absent
+
+          - name: Enable Django nginx site
+            file:
+              src: /etc/nginx/sites-available/django.conf
+              dest: /etc/nginx/sites-enabled/django.conf
+              state: link
+
+          - name: Validate nginx configuration
+            command: nginx -t
+            changed_when: false
+
+          - name: Restart nginx to apply configuration
+            service:
+              name: nginx
+              state: restarted
+              enabled: yes
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/django-24-04/opt/cloudstack/django-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/django-24-04/opt/cloudstack/django-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/django-24-04_cleanup.sh && /opt/cloudstack/django-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
