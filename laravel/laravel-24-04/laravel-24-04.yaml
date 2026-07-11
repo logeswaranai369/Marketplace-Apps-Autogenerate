@@ -1,0 +1,317 @@
+- name: Laravel Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Laravel
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+          - name: Generating laravel_db_password
+            shell: openssl rand -hex 24
+            register: laravel_db_password
+
+          - name: Storing laravel_db_password
+            copy:
+              dest: "/root/.laravel_db_password"
+              content: |
+                laravel_db_password = "{{ laravel_db_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install nginx web server
+            apt:
+              name:
+                - nginx
+              state: latest
+              lock_timeout: 300
+
+          - name: Install PHP 8.3 CLI, FPM and required extensions
+            apt:
+              name:
+                - php8.3-cli
+                - php8.3-fpm
+                - php8.3-mbstring
+                - php8.3-xml
+                - php8.3-curl
+                - php8.3-zip
+                - php8.3-mysql
+                - php8.3-bcmath
+                - php8.3-gd
+              state: latest
+              lock_timeout: 300
+
+          - name: Install MySQL server
+            apt:
+              name:
+                - mysql-server
+              state: latest
+              lock_timeout: 300
+
+          - name: Install tooling (unzip, git, PyMySQL for DB admin)
+            apt:
+              name:
+                - unzip
+                - git
+                - python3-pymysql
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure nginx, php-fpm and mysql are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - nginx
+              - php8.3-fpm
+              - mysql
+
+          - name: Install Composer
+            debug:
+              msg: "Installing Composer to /usr/local/bin/composer"
+
+          - name: Download Composer phar
+            get_url:
+              url: https://getcomposer.org/download/latest-stable/composer.phar
+              dest: /usr/local/bin/composer
+              mode: '0755'
+
+          # MySQL 8 on Ubuntu 24.04 uses auth_socket for root by default. Setting a password with
+          # mysql_native_password REPLACES socket auth (rule 21) so all later DB admin must pass the
+          # password. Gate on the PLUGIN, not a login test, to stay idempotent.
+          - name: Secure MySQL root (set native password only if still on auth_socket)
+            shell: |
+              plugin=$(mysql -N -B -e "SELECT plugin FROM mysql.user WHERE user='root' AND host='localhost';")
+              if [ "$plugin" != "mysql_native_password" ]; then
+                mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ mysql_root_password.stdout }}'; FLUSH PRIVILEGES;"
+              fi
+            args:
+              executable: /bin/bash
+
+          - name: Create Laravel database
+            community.mysql.mysql_db:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: laravel
+              encoding: utf8mb4
+              collation: utf8mb4_unicode_ci
+              state: present
+
+          - name: Create Laravel database user
+            community.mysql.mysql_user:
+              login_user: root
+              login_password: "{{ mysql_root_password.stdout }}"
+              name: laravel
+              password: "{{ laravel_db_password.stdout }}"
+              host: localhost
+              priv: "laravel.*:ALL"
+              state: present
+
+          - name: Prepare Laravel project directory
+            debug:
+              msg: "Creating /var/www/laravel owned by www-data before composer create-project"
+
+          - name: Ensure /var/www/laravel exists and is owned by www-data
+            file:
+              path: /var/www/laravel
+              state: directory
+              owner: www-data
+              group: www-data
+              mode: '0755'
+
+          - name: Check if Laravel is already installed
+            stat:
+              path: /var/www/laravel/artisan
+            register: laravel_installed
+
+          - name: Install Laravel via Composer (as www-data)
+            command: >
+              runuser -u www-data -- env COMPOSER_HOME=/tmp/composer
+              composer create-project laravel/laravel:^12.0 /var/www/laravel --no-interaction
+            args:
+              chdir: /var/www
+              creates: /var/www/laravel/artisan
+            when: not laravel_installed.stat.exists
+
+          - name: Generate Laravel application key (MANDATORY, --force is re-run safe)
+            command: php /var/www/laravel/artisan key:generate --force
+            become_user: www-data
+
+          - name: Configure .env application settings
+            lineinfile:
+              path: /var/www/laravel/.env
+              regexp: "^{{ item.key }}="
+              line: "{{ item.key }}={{ item.value }}"
+            loop:
+              - { key: 'APP_ENV', value: 'production' }
+              - { key: 'APP_DEBUG', value: 'false' }
+              - { key: 'APP_URL', value: 'http://localhost' }
+              - { key: 'DB_CONNECTION', value: 'mysql' }
+              - { key: 'DB_HOST', value: '127.0.0.1' }
+              - { key: 'DB_PORT', value: '3306' }
+              - { key: 'DB_DATABASE', value: 'laravel' }
+              - { key: 'DB_USERNAME', value: 'laravel' }
+
+          - name: Set DB password in .env (real generated value)
+            lineinfile:
+              path: /var/www/laravel/.env
+              regexp: "^DB_PASSWORD="
+              line: "DB_PASSWORD={{ laravel_db_password.stdout }}"
+
+          - name: Run database migrations
+            command: php /var/www/laravel/artisan migrate --force
+            become_user: www-data
+
+          - name: Fix ownership of Laravel project
+            file:
+              path: /var/www/laravel
+              state: directory
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Ensure storage and cache directories are group-writable
+            command: "find /var/www/laravel/{{ item }} -type d -exec chmod 775 {} +"
+            loop:
+              - storage
+              - bootstrap/cache
+
+          - name: Deploy nginx vhost for Laravel
+            debug:
+              msg: "Configuring nginx vhost with docroot /var/www/laravel/public"
+
+          - name: Write nginx vhost
+            copy:
+              dest: /etc/nginx/sites-available/laravel
+              content: |
+                server {
+                    listen 80 default_server;
+                    listen [::]:80 default_server;
+                    server_name _;
+
+                    root /var/www/laravel/public;
+                    index index.php index.html;
+
+                    charset utf-8;
+
+                    location / {
+                        try_files $uri $uri/ /index.php?$query_string;
+                    }
+
+                    location = /favicon.ico { access_log off; log_not_found off; }
+                    location = /robots.txt  { access_log off; log_not_found off; }
+
+                    error_page 404 /index.php;
+
+                    location ~ \.php$ {
+                        include snippets/fastcgi-php.conf;
+                        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+                        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+                        include fastcgi_params;
+                    }
+
+                    location ~ /\.(?!well-known).* {
+                        deny all;
+                    }
+                }
+              mode: '0644'
+
+          - name: Enable Laravel vhost
+            file:
+              src: /etc/nginx/sites-available/laravel
+              dest: /etc/nginx/sites-enabled/laravel
+              state: link
+
+          - name: Remove default nginx site
+            file:
+              path: /etc/nginx/sites-enabled/default
+              state: absent
+
+          - name: Test nginx configuration
+            command: nginx -t
+
+          - name: Restart nginx and php-fpm
+            service:
+              name: "{{ item }}"
+              state: restarted
+            loop:
+              - php8.3-fpm
+              - nginx
+
+          - name: Wait for Laravel to serve the welcome page
+            uri:
+              url: http://localhost/
+              return_content: yes
+            register: laravel_serve
+            until: laravel_serve.status == 200 and 'Laravel' in laravel_serve.get('content','')
+            retries: 20
+            delay: 6
+
+          - name: Write credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+              content: |
+                Laravel Deployment Credentials
+                App URL:        http://<server-ip>/
+                Project path:   /var/www/laravel (owned by www-data)
+
+                Database:       laravel
+                DB user:        laravel
+                DB password:    {{ laravel_db_password.stdout }}
+                MySQL root pw:  {{ mysql_root_password.stdout }}
+
+                Run artisan as: sudo -u www-data php /var/www/laravel/artisan ...
+                Firewall:       open 80/tcp (and 443 if adding TLS)
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/laravel-24-04/opt/cloudstack/laravel-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/laravel-24-04/opt/cloudstack/laravel-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/laravel-24-04_cleanup.sh && /opt/cloudstack/laravel-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
