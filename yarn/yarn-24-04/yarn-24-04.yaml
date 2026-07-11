@@ -1,0 +1,123 @@
+- name: Yarn Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Yarn
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install base prerequisite packages
+            apt:
+              name:
+                - ca-certificates
+                - curl
+                - gnupg
+              state: latest
+              lock_timeout: 300
+
+          - name: Install NodeSource signing key (keyring pattern, not apt-key)
+            shell: |
+              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
+            args:
+              creates: /usr/share/keyrings/nodesource.gpg
+
+          - name: Add NodeSource 20.x apt repository
+            apt_repository:
+              repo: "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main"
+              filename: nodesource
+              state: present
+
+          - name: Install Node.js 20.x (bundles npm and corepack)
+            apt:
+              name: nodejs
+              state: latest
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Enable corepack (creates yarn/yarnpkg shims system-wide)
+            command: corepack enable
+            changed_when: false
+
+          - name: Activate pinned Yarn 3.4.1 via corepack
+            command: corepack prepare yarn@3.4.1 --activate
+            changed_when: false
+
+          - name: Verify Node.js is installed
+            command: node --version
+            register: node_version
+            changed_when: false
+
+          - name: Show Node.js version
+            debug:
+              msg: "Node.js version: {{ node_version.stdout }}"
+
+          # Run yarn --version once now so corepack's first-run yarn download happens at
+          # build time (not on the operator's first use). A non-zero rc = the real failure
+          # signal for this CLI tool (shim not on PATH / corepack not activated).
+          - name: Verify Yarn is installed and functional
+            command: yarn --version
+            register: yarn_version
+            changed_when: false
+            failed_when: yarn_version.rc != 0
+
+          - name: Show Yarn version
+            debug:
+              msg: "Yarn version: {{ yarn_version.stdout }}"
+
+          - name: Write usage note for the operator
+            copy:
+              dest: /home/ubuntu/README
+              content: |
+                Node.js 20.x + Yarn 3.4.1 installed via corepack.
+                Test with `yarn --version`.
+                Change active Yarn version with `corepack prepare yarn@<ver> --activate`.
+                In a project dir: yarn init, yarn add <pkg>, yarn install, yarn run <script>.
+                There is no service, port, or web UI.
+              owner: ubuntu
+              group: ubuntu
+              mode: '0644'
+            ignore_errors: yes
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/yarn-24-04/opt/cloudstack/yarn-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/yarn-24-04/opt/cloudstack/yarn-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/yarn-24-04_cleanup.sh && /opt/cloudstack/yarn-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
