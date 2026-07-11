@@ -1,0 +1,232 @@
+- name: Pritunl Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Pritunl
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages for repo setup
+            apt:
+              name:
+                - gnupg
+                - curl
+                - ca-certificates
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure keyrings directory exists
+            file:
+              path: /usr/share/keyrings
+              state: directory
+              mode: '0755'
+
+          - name: "Download Pritunl GPG key (note: pritunl_repo_pub.asc — _pub not _public)"
+            get_url:
+              url: https://raw.githubusercontent.com/pritunl/pgp/master/pritunl_repo_pub.asc
+              dest: /tmp/pritunl.asc
+              mode: '0644'
+
+          - name: Dearmor Pritunl GPG key into keyring
+            command: gpg --dearmor -o /usr/share/keyrings/pritunl.gpg /tmp/pritunl.asc
+            args:
+              creates: /usr/share/keyrings/pritunl.gpg
+
+          - name: Download MongoDB 8.0 GPG key
+            get_url:
+              url: https://www.mongodb.org/static/pgp/server-8.0.asc
+              dest: /tmp/mongodb-server-8.0.asc
+              mode: '0644'
+
+          - name: Dearmor MongoDB GPG key into keyring
+            command: gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg /tmp/mongodb-server-8.0.asc
+            args:
+              creates: /usr/share/keyrings/mongodb-server-8.0.gpg
+
+          - name: Add Pritunl stable apt repository
+            apt_repository:
+              repo: "deb [signed-by=/usr/share/keyrings/pritunl.gpg] https://repo.pritunl.com/stable/apt noble main"
+              filename: pritunl
+              state: present
+
+          - name: Add MongoDB 8.0 apt repository
+            apt_repository:
+              repo: "deb [ signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse"
+              filename: mongodb-org-8.0
+              state: present
+
+          - name: Update apt cache after adding repositories
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: "Install MongoDB server (backing store)"
+            apt:
+              name:
+                - mongodb-org
+              state: latest
+              lock_timeout: 300
+
+          - name: "Install VPN dependencies (OpenVPN + WireGuard)"
+            apt:
+              name:
+                - openvpn
+                - wireguard
+                - wireguard-tools
+              state: latest
+              lock_timeout: 300
+
+          - name: "Install Pritunl VPN server"
+            apt:
+              name:
+                - pritunl
+              state: latest
+              lock_timeout: 300
+
+          - name: "Stage 1 — enable and start MongoDB FIRST (Pritunl needs it ready)"
+            debug:
+              msg: "Enabling and starting mongod before Pritunl"
+
+          - name: Enable and start mongod
+            service:
+              name: mongod
+              state: started
+              enabled: yes
+
+          - name: Wait for MongoDB to accept connections on 27017
+            wait_for:
+              host: 127.0.0.1
+              port: 27017
+              timeout: 90
+
+          - name: "Stage 2 — enable and start Pritunl (unit ships with the package)"
+            debug:
+              msg: "Starting Pritunl now that MongoDB is ready"
+
+          - name: Enable and start pritunl
+            service:
+              name: pritunl
+              state: started
+              enabled: yes
+
+          - name: Wait for Pritunl admin UI to bind on 443
+            wait_for:
+              host: 127.0.0.1
+              port: 443
+              timeout: 90
+
+          - name: "Stage 3 — verify Pritunl HTTPS admin UI serves 200 (self-signed)"
+            debug:
+              msg: "Checking https://localhost/ returns 200"
+
+          - name: Insecure HTTPS serve-check of Pritunl admin UI
+            uri:
+              url: https://localhost/
+              validate_certs: no
+              status_code: 200
+            register: pritunl_ui
+            until: pritunl_ui.status == 200
+            retries: 20
+            delay: 6
+
+          - name: "Stage 4 — capture generated admin credentials and setup key"
+            debug:
+              msg: "Retrieving pritunl default-password and setup-key (read-only, re-runnable)"
+
+          - name: Retrieve generated default admin credentials
+            command: pritunl default-password
+            register: pritunl_default_password
+            until: pritunl_default_password.rc == 0
+            retries: 20
+            delay: 6
+            failed_when: false
+            changed_when: false
+
+          - name: Retrieve first-run setup key
+            command: pritunl setup-key
+            register: pritunl_setup_key
+            failed_when: false
+            changed_when: false
+
+          - name: Ensure /home/ubuntu exists for credentials file
+            file:
+              path: /home/ubuntu
+              state: directory
+              owner: ubuntu
+              group: ubuntu
+              mode: '0755'
+            ignore_errors: yes
+
+          - name: Write credentials/notes file for the operator
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+              content: |
+                Pritunl VPN Server — Access Details
+
+                Admin UI:  https://<server-ip>/   (accept the self-signed certificate warning)
+
+                Admin login (from `pritunl default-password`):
+                {{ pritunl_default_password.stdout | default('run: pritunl default-password') }}
+
+                First-run setup key (paste into the UI setup screen; from `pritunl setup-key`):
+                {{ pritunl_setup_key.stdout | default('run: pritunl setup-key') }}
+
+                Default MongoDB URI (works out of the box): mongodb://localhost:27017/pritunl
+
+                Firewall:
+                  - Open 443/tcp to trusted IPs for the admin UI.
+                  - Open the VPN ports you later assign in the UI
+                    (OpenVPN udp/1194 or your chosen port; WireGuard the udp port you assign).
+
+                Production hardening:
+                  - Replace the self-signed cert with a real one (Let's Encrypt via UI settings).
+                  - Set a real domain, change the admin password on first login.
+                  - Restrict admin UI access to trusted networks.
+            ignore_errors: yes
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/pritunl-24-04/opt/cloudstack/pritunl-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/pritunl-24-04/opt/cloudstack/pritunl-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/pritunl-24-04_cleanup.sh && /opt/cloudstack/pritunl-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
