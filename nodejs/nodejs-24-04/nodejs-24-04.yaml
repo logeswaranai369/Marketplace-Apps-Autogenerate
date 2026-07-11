@@ -1,0 +1,227 @@
+- name: Node.js Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Node.js
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install NodeSource prerequisites
+            apt:
+              name:
+                - ca-certificates
+                - curl
+                - gnupg
+              state: latest
+              lock_timeout: 300
+
+          - name: Download and dearmor the NodeSource GPG key (keyring pattern, not apt-key)
+            shell: |
+              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
+            args:
+              creates: /usr/share/keyrings/nodesource.gpg
+
+          - name: Add NodeSource 20.x repository
+            apt_repository:
+              repo: "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main"
+              state: present
+              filename: nodesource
+              update_cache: yes
+
+          - name: Install Node.js 20.x (bundles npm)
+            apt:
+              name: nodejs
+              state: latest
+              lock_timeout: 300
+
+          - name: Install nginx reverse proxy
+            apt:
+              name: nginx
+              state: latest
+              lock_timeout: 300
+
+          - name: Check whether PM2 is already installed
+            command: which pm2
+            register: pm2_check
+            failed_when: false
+            changed_when: false
+
+          - name: Install PM2 globally via npm
+            shell: npm install -g pm2
+            when: pm2_check.rc != 0
+
+          - name: Debug - create service user
+            debug:
+              msg: "Creating dedicated non-root service user 'nodeapp'"
+
+          - name: Create nodeapp service user (idempotent)
+            user:
+              name: nodeapp
+              home: /home/nodeapp
+              shell: /bin/bash
+              create_home: yes
+              system: no
+
+          - name: Deploy minimal Node.js sample app (binds 127.0.0.1:3000)
+            copy:
+              dest: /home/nodeapp/app.js
+              owner: nodeapp
+              group: nodeapp
+              mode: '0644'
+              content: |
+                const http = require('http');
+                http.createServer((req, res) => {
+                  res.writeHead(200, { 'Content-Type': 'text/html' });
+                  res.end('<h1>Hello from Node.js</h1><p>Powered by Node + PM2 + nginx on StackBill.</p>');
+                }).listen(3000, '127.0.0.1');
+
+          - name: Debug - start sample app under PM2
+            debug:
+              msg: "Starting sample app under PM2 as nodeapp so :3000 is up before nginx"
+
+          - name: Check whether the PM2 'hello' process already exists
+            shell: su - nodeapp -c "pm2 describe hello"
+            register: pm2_hello
+            failed_when: false
+            changed_when: false
+
+          - name: Start sample app under PM2 (first run)
+            shell: su - nodeapp -c "pm2 start /home/nodeapp/app.js --name hello"
+            when: pm2_hello.rc != 0
+
+          - name: Restart sample app under PM2 (re-run/repair)
+            shell: su - nodeapp -c "pm2 restart hello"
+            when: pm2_hello.rc == 0
+
+          - name: Persist PM2 process list
+            shell: su - nodeapp -c "pm2 save"
+
+          - name: Install PM2 systemd boot unit for nodeapp
+            shell: env PATH=$PATH:/usr/bin pm2 startup systemd -u nodeapp --hp /home/nodeapp
+            register: pm2_startup
+            changed_when: false
+
+          - name: Enable pm2-nodeapp unit (enable only; it resurrects on boot, do not start)
+            service:
+              name: pm2-nodeapp
+              enabled: yes
+
+          - name: Debug - wire up nginx reverse proxy
+            debug:
+              msg: "Removing packaged default site and enabling nodeapp reverse-proxy vhost"
+
+          - name: Deploy nginx reverse-proxy vhost (URL-agnostic, proxies to Node on :3000)
+            copy:
+              dest: /etc/nginx/sites-available/nodeapp.conf
+              mode: '0644'
+              content: |
+                server {
+                    listen 80 default_server;
+                    listen [::]:80 default_server;
+                    server_name _;
+
+                    location / {
+                        proxy_pass http://127.0.0.1:3000;
+                        proxy_http_version 1.1;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Real-IP $remote_addr;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+                }
+
+          - name: Remove packaged default nginx site so it does not shadow the vhost
+            file:
+              path: /etc/nginx/sites-enabled/default
+              state: absent
+
+          - name: Enable nodeapp vhost via symlink
+            file:
+              src: /etc/nginx/sites-available/nodeapp.conf
+              dest: /etc/nginx/sites-enabled/nodeapp.conf
+              state: link
+
+          - name: Validate nginx configuration
+            command: nginx -t
+            changed_when: false
+
+          - name: Enable and restart nginx (after Node app is up)
+            service:
+              name: nginx
+              state: restarted
+              enabled: yes
+
+          - name: Debug - verify the app SERVES through nginx
+            debug:
+              msg: "Polling http://localhost/ until it returns the Node sample app (not the nginx welcome page)"
+
+          - name: Wait until the Node app serves 200 through nginx with its marker
+            uri:
+              url: http://localhost/
+              return_content: yes
+              status_code: 200
+            register: node_health
+            until: node_health.status == 200 and 'Hello' in node_health.get('content','')
+            retries: 15
+            delay: 4
+
+          - name: Write credentials/summary file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                Node.js hosting environment (Node 20.x LTS + npm + PM2 + nginx)
+                Sample app:   /home/nodeapp/app.js  (runs as user 'nodeapp')
+                PM2 process:  hello  (pm2 list / pm2 logs / pm2 restart hello)
+                nginx vhost:  /etc/nginx/sites-available/nodeapp.conf -> proxies port 80 to 127.0.0.1:3000
+                Service user: nodeapp (no shell password set by default)
+
+                Replace the sample app with your own code, then:
+                  su - nodeapp -c "pm2 start /home/nodeapp/yourapp.js --name <name>"
+                  su - nodeapp -c "pm2 save"
+                Adjust proxy_pass in the nginx vhost if your app uses a different port.
+            ignore_errors: yes
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/nodejs-24-04/opt/cloudstack/nodejs-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/nodejs-24-04/opt/cloudstack/nodejs-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/nodejs-24-04_cleanup.sh && /opt/cloudstack/nodejs-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
