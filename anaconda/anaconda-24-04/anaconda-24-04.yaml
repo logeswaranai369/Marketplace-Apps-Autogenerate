@@ -1,0 +1,118 @@
+- name: Anaconda Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Anaconda
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages
+            apt:
+              name:
+                - wget
+                - bzip2
+                - ca-certificates
+              state: latest
+              lock_timeout: 300
+
+          - name: Download Anaconda installer
+            get_url:
+              url: https://repo.anaconda.com/archive/Anaconda3-2025.12-2-Linux-x86_64.sh
+              dest: /tmp/anaconda.sh
+              mode: '0755'
+
+          - name: Install Anaconda3 silently to /opt/anaconda3 (idempotent)
+            debug:
+              msg: "Installing Anaconda3 2025.12-2 non-interactively into /opt/anaconda3"
+
+          - name: Run the Anaconda batch installer
+            command: bash /tmp/anaconda.sh -b -p /opt/anaconda3
+            args:
+              creates: /opt/anaconda3/bin/conda
+
+          - name: Put conda on PATH for all login shells (system-wide profile)
+            copy:
+              dest: /etc/profile.d/conda.sh
+              mode: '0644'
+              content: |
+                # System-wide conda initialization for Anaconda3 installed at /opt/anaconda3
+                # Makes `conda` available to all login shells.
+                if [ -f /opt/anaconda3/etc/profile.d/conda.sh ]; then
+                    . /opt/anaconda3/etc/profile.d/conda.sh
+                else
+                    export PATH="/opt/anaconda3/bin:$PATH"
+                fi
+
+          - name: Accept Anaconda Terms of Service (tolerant of builds that don't require it)
+            command: "{{ item }}"
+            loop:
+              - /opt/anaconda3/bin/conda tos accept --override-channels --channel defaults
+              - /opt/anaconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+            failed_when: false
+            changed_when: false
+
+          - name: Verify conda is installed and working (this is the health check for a CLI tool)
+            debug:
+              msg: "Verifying conda installation"
+
+          - name: Check conda --version
+            command: /opt/anaconda3/bin/conda --version
+            register: conda_version
+            changed_when: false
+
+          - name: Assert conda reports its version
+            assert:
+              that:
+                - conda_version.rc == 0
+                - conda_version.stdout is search('^conda')
+              fail_msg: "conda --version did not return a valid version string"
+
+          - name: Check conda info
+            command: /opt/anaconda3/bin/conda info
+            register: conda_info
+            changed_when: false
+            failed_when: conda_info.rc != 0
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/anaconda-24-04/opt/cloudstack/anaconda-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/anaconda-24-04/opt/cloudstack/anaconda-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/anaconda-24-04_cleanup.sh && /opt/cloudstack/anaconda-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
