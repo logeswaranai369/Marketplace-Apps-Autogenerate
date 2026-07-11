@@ -1,0 +1,119 @@
+- name: Miniconda Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Miniconda
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install Miniconda prerequisite packages
+            apt:
+              name:
+                - wget
+                - bzip2
+                - ca-certificates
+              state: latest
+              lock_timeout: 300
+
+          - name: Check if Miniconda is already installed
+            stat:
+              path: /opt/miniconda3/bin/conda
+            register: conda_installed
+
+          - name: Download Miniconda batch installer (pinned version)
+            get_url:
+              url: https://repo.anaconda.com/miniconda/Miniconda3-py312_26.5.3-1-Linux-x86_64.sh
+              dest: /tmp/miniconda.sh
+              mode: '0755'
+            when: not conda_installed.stat.exists
+
+          - name: Install Miniconda non-interactively to /opt/miniconda3
+            command: bash /tmp/miniconda.sh -b -p /opt/miniconda3
+            args:
+              creates: /opt/miniconda3/bin/conda
+            when: not conda_installed.stat.exists
+
+          - name: Accept default-channel Terms of Service so conda install/update work out of the box
+            command: "/opt/miniconda3/bin/conda tos accept --override-channels --channel {{ item }}"
+            loop:
+              - defaults
+              - https://repo.anaconda.com/pkgs/main
+            failed_when: false
+            changed_when: false
+
+          - name: Put conda on PATH for every login shell system-wide
+            copy:
+              dest: /etc/profile.d/conda.sh
+              mode: '0644'
+              content: |
+                # System-wide conda activation for all login shells (Miniconda @ /opt/miniconda3)
+                # Managed by StackBill marketplace install — do not edit by hand.
+                if [ -f /opt/miniconda3/etc/profile.d/conda.sh ]; then
+                    . /opt/miniconda3/etc/profile.d/conda.sh
+                else
+                    case ":${PATH}:" in
+                        *:/opt/miniconda3/bin:*) ;;
+                        *) PATH="/opt/miniconda3/bin:${PATH}" ;;
+                    esac
+                    export PATH
+                fi
+
+          - name: Verify conda binary reports its version
+            command: /opt/miniconda3/bin/conda --version
+            register: conda_version
+            changed_when: false
+            failed_when: conda_version.rc != 0 or not conda_version.stdout.startswith('conda')
+
+          - name: Show installed conda version
+            debug:
+              msg: "Miniconda installed successfully: {{ conda_version.stdout }}"
+
+          - name: Verify conda environment info is reachable
+            command: /opt/miniconda3/bin/conda info
+            register: conda_info
+            changed_when: false
+            failed_when: conda_info.rc != 0
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/miniconda-24-04/opt/cloudstack/miniconda-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/miniconda-24-04/opt/cloudstack/miniconda-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/miniconda-24-04_cleanup.sh && /opt/cloudstack/miniconda-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
