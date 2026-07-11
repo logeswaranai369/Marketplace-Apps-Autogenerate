@@ -1,0 +1,152 @@
+- name: Ant Media Server Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Ant Media Server
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages
+            apt:
+              name:
+                - wget
+                - unzip
+                - ca-certificates
+              state: latest
+              lock_timeout: 300
+
+          - name: Download Ant Media Server Community Edition zip (~360 MB)
+            debug:
+              msg: "Downloading Ant Media Server Community Edition 3.0.3 package"
+
+          - name: Fetch Ant Media Server Community zip
+            get_url:
+              url: https://github.com/ant-media/Ant-Media-Server/releases/download/ams-v3.0.3/ant-media-server-community-3.0.3.zip
+              dest: /tmp/ant-media-server-community-3.0.3.zip
+              mode: '0644'
+
+          - name: Fetch official Ant Media installer script
+            get_url:
+              url: https://raw.githubusercontent.com/ant-media/Scripts/master/install_ant-media-server.sh
+              dest: /tmp/install_ant-media-server.sh
+              mode: '0755'
+
+          - name: Create dedicated empty run directory for the vendor installer
+            file:
+              path: /opt/ams-install
+              state: directory
+              mode: '0755'
+
+          - name: Run the official Ant Media installer
+            debug:
+              msg: "Running the Ant Media official installer (JDK + 360MB extract, this is slow)"
+
+          # Run from an EMPTY dedicated dir (NOT /tmp) — the vendor script does a bare `unzip $ZIP`
+          # in its CWD; /tmp holds the pre-extracted payload and would trigger an interactive
+          # overwrite prompt -> EOF (no TTY) -> installs nothing. Reference payload by absolute path.
+          - name: Install Ant Media Server via official installer
+            command: bash /tmp/install_ant-media-server.sh -i /tmp/ant-media-server-community-3.0.3.zip
+            args:
+              chdir: /opt/ams-install
+              creates: /usr/local/antmedia/antmedia
+            async: 1800
+            poll: 30
+
+          - name: Ensure antmedia service is enabled and started
+            service:
+              name: antmedia
+              enabled: yes
+              state: started
+
+          - name: Wait for the web management panel to bind on port 5080 (Java warm-up)
+            debug:
+              msg: "Waiting for Ant Media web panel on port 5080 (may take 30-90s after start)"
+
+          - name: Wait for port 5080 to be listening
+            wait_for:
+              port: 5080
+              host: 127.0.0.1
+              timeout: 180
+
+          - name: Verify the web panel serves HTTP 200
+            uri:
+              url: http://localhost:5080/
+              status_code: 200
+            register: ams_panel
+            until: ams_panel.status == 200
+            retries: 30
+            delay: 6
+
+          - name: Write first-run guidance file for the operator
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0644'
+              content: |
+                Ant Media Server (Community Edition 3.0.3) — Access & First-Run Guide
+
+                Web management panel : http://<server-ip>:5080/
+                  -> FIRST VISIT: the panel shows a "Create your admin account" screen.
+                     There is NO default username/password. Set the admin user there.
+
+                Install directory    : /usr/local/antmedia
+                Service              : systemctl status antmedia
+                Logs                 : /var/log/antmedia
+
+                Streaming ports that must be open for real use:
+                  5080/tcp        -> web panel (HTTP)
+                  5443/tcp        -> web panel (HTTPS, after SSL setup)
+                  1935/tcp        -> RTMP ingest/publish
+                  80,443/tcp      -> Let's Encrypt SSL setup
+                  5000-65000/udp  -> WebRTC / SRTP media (required for actual streaming)
+
+                PRODUCTION HARDENING:
+                  1. Create the admin account immediately, BEFORE exposing port 5080.
+                  2. Run the bundled SSL setup (enable_ssl.sh in /usr/local/antmedia) to
+                     serve the panel over HTTPS on 5443.
+                  3. Restrict 5080 to trusted IPs at the security-group / UFW level.
+
+                NOTE: Community Edition = single server, no clustering.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/ant-media-server-24-04/opt/cloudstack/ant-media-server-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/ant-media-server-24-04/opt/cloudstack/ant-media-server-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/ant-media-server-24-04_cleanup.sh && /opt/cloudstack/ant-media-server-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
