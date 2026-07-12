@@ -1,0 +1,158 @@
+- name: ownCloud Infinite Scale (oCIS) Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure ownCloud Infinite Scale (oCIS)
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating ocis_admin_pass
+            shell: openssl rand -hex 24
+            register: ocis_admin_pass
+
+          - name: Storing ocis_admin_pass
+            copy:
+              dest: "/root/.ocis_admin_pass"
+              content: |
+                ocis_admin_pass = "{{ ocis_admin_pass.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/owncloud-infinite-scale-24-04/etc/systemd/system/ocis.service', confdest: '/etc/systemd/system/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install oCIS prerequisites
+            apt:
+              name:
+                - ca-certificates
+                - wget
+              state: latest
+              lock_timeout: 300
+
+          - name: Download pinned oCIS single binary
+            get_url:
+              url: https://github.com/owncloud/ocis/releases/download/v8.1.0/ocis-8.1.0-linux-amd64
+              dest: /usr/bin/ocis
+              mode: '0755'
+
+          - name: Create oCIS config and data directories
+            file:
+              path: "{{ item }}"
+              state: directory
+              mode: '0755'
+            loop:
+              - /etc/ocis
+              - /var/lib/ocis
+
+          - name: Write oCIS environment file (embeds generated admin password)
+            copy:
+              dest: /etc/ocis/ocis.env
+              mode: '0600'
+              content: |
+                OCIS_URL=https://localhost:9200
+                PROXY_HTTP_ADDR=0.0.0.0:9200
+                OCIS_INSECURE=true
+                OCIS_LOG_LEVEL=error
+                OCIS_CONFIG_DIR=/etc/ocis
+                OCIS_BASE_DATA_PATH=/var/lib/ocis
+                IDM_ADMIN_PASSWORD={{ ocis_admin_pass.stdout }}
+
+          - name: Check if oCIS is already initialized
+            stat:
+              path: /etc/ocis/ocis.yaml
+            register: ocis_cfg
+
+          - name: Initialize oCIS (non-interactive, forced admin password)
+            command: >
+              ocis init --insecure true
+              --admin-password "{{ ocis_admin_pass.stdout }}"
+              --config-path /etc/ocis
+            environment:
+              IDM_ADMIN_PASSWORD: "{{ ocis_admin_pass.stdout }}"
+            when: not ocis_cfg.stat.exists
+
+          - name: Reload systemd so it picks up the ocis unit
+            systemd:
+              daemon_reload: yes
+
+          - name: Enable and start oCIS service
+            service:
+              name: ocis
+              state: started
+              enabled: yes
+
+          - name: Wait for oCIS to bind port 9200
+            wait_for:
+              port: 9200
+              host: 127.0.0.1
+              timeout: 120
+
+          - name: Verify oCIS web UI actually serves over HTTPS (self-signed, gate on status only)
+            uri:
+              url: https://localhost:9200/
+              validate_certs: no
+              status_code: 200
+            register: r
+            until: r.status == 200
+            retries: 30
+            delay: 6
+
+          - name: Write credentials file for the operator
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0644'
+              content: |
+                ownCloud Infinite Scale (oCIS)
+                Web UI : https://<server-ip>:9200/  (accept the self-signed cert warning)
+                Login  : admin / {{ ocis_admin_pass.stdout }}
+                Binary : /usr/bin/ocis   Config: /etc/ocis/ (ocis.env, ocis.yaml)   Data: /var/lib/ocis
+                Service: systemctl status ocis    Logs: journalctl -u ocis -f
+
+                Production hardening: set OCIS_URL to your real https domain in /etc/ocis/ocis.env,
+                install a real TLS cert (or terminate TLS at a reverse proxy) and set OCIS_INSECURE=false,
+                run oCIS as a dedicated non-root user, then systemctl restart ocis.
+                Change the admin password on first login.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/owncloud-infinite-scale-24-04/opt/cloudstack/owncloud-infinite-scale-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/owncloud-infinite-scale-24-04/opt/cloudstack/owncloud-infinite-scale-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/owncloud-infinite-scale-24-04_cleanup.sh && /opt/cloudstack/owncloud-infinite-scale-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
