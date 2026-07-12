@@ -1,0 +1,236 @@
+- name: Nextcloud Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Nextcloud
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating user_db_pass
+            shell: openssl rand -hex 24
+            register: user_db_pass
+
+          - name: Storing user_db_pass
+            copy:
+              dest: "/root/.user_db_pass"
+              content: |
+                user_db_pass = "{{ user_db_pass.stdout }}"
+          - name: Generating admin_pass
+            shell: openssl rand -hex 24
+            register: admin_pass
+
+          - name: Storing admin_pass
+            copy:
+              dest: "/root/.admin_pass"
+              content: |
+                admin_pass = "{{ admin_pass.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/nextcloud/etc/apache2/sites-available/nextcloud.conf', confdest: '/etc/apache2/sites-available/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install Apache web server
+            apt:
+              name:
+                - apache2
+              state: latest
+              lock_timeout: 300
+
+          - name: Install PHP and required extensions
+            apt:
+              name:
+                - php
+                - libapache2-mod-php
+                - php-gd
+                - php-mysql
+                - php-curl
+                - php-mbstring
+                - php-intl
+                - php-gmp
+                - php-bcmath
+                - php-xml
+                - php-imagick
+                - php-zip
+                - php-apcu
+                - php-redis
+              state: latest
+              lock_timeout: 300
+
+          - name: Install MariaDB database server
+            apt:
+              name:
+                - mariadb-server
+                - python3-pymysql
+              state: latest
+              lock_timeout: 300
+
+          - name: Install Redis and helper tools
+            apt:
+              name:
+                - redis-server
+                - unzip
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure Apache, MariaDB and Redis are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - apache2
+              - mariadb
+              - redis-server
+
+          - name: Create Nextcloud database
+            community.mysql.mysql_db:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: nextcloud
+              encoding: utf8mb4
+              collation: utf8mb4_general_ci
+              state: present
+
+          - name: Create Nextcloud database user
+            community.mysql.mysql_user:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: nextcloud
+              password: "{{ user_db_pass.stdout }}"
+              host: localhost
+              priv: "nextcloud.*:ALL"
+              state: present
+
+          - name: Download Nextcloud release (pinned + checksum verified, idempotent)
+            get_url:
+              url: https://download.nextcloud.com/server/releases/nextcloud-34.0.1.zip
+              dest: /usr/local/src/nextcloud-34.0.1.zip
+              checksum: "sha256:https://download.nextcloud.com/server/releases/nextcloud-34.0.1.zip.sha256"
+              mode: '0644'
+
+          - name: Check if Nextcloud is already extracted
+            stat:
+              path: /var/www/html/nextcloud/occ
+            register: nc_extracted
+
+          - name: Extract Nextcloud to web root
+            unarchive:
+              src: /usr/local/src/nextcloud-34.0.1.zip
+              dest: /var/www/html/
+              remote_src: yes
+            when: not nc_extracted.stat.exists
+
+          - name: Ensure Nextcloud files are owned by www-data
+            file:
+              path: /var/www/html/nextcloud
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Check if Nextcloud is already installed
+            command: sudo -u www-data php /var/www/html/nextcloud/occ status
+            register: nc_status
+            changed_when: false
+            failed_when: false
+
+          - name: Run Nextcloud headless install (occ maintenance:install)
+            command: >
+              sudo -u www-data php /var/www/html/nextcloud/occ maintenance:install
+              --database mysql --database-name nextcloud --database-user nextcloud
+              --database-pass "{{ user_db_pass.stdout }}"
+              --admin-user admin --admin-pass "{{ admin_pass.stdout }}"
+              --data-dir /var/www/html/nextcloud/data
+            when: "'installed: true' not in nc_status.stdout"
+
+          - name: Configure trusted domains (localhost + wildcard for any host/IP)
+            command: "sudo -u www-data php /var/www/html/nextcloud/occ config:system:set trusted_domains {{ item.idx }} --value={{ item.val }}"
+            loop:
+              - { idx: 0, val: "localhost" }
+              - { idx: 1, val: "'*'" }
+            changed_when: false
+
+          - name: Wire Redis + APCu caching via occ
+            command: "sudo -u www-data php /var/www/html/nextcloud/occ {{ item }}"
+            loop:
+              - "config:system:set memcache.local --value '\\OC\\Memcache\\APCu'"
+              - "config:system:set memcache.locking --value '\\OC\\Memcache\\Redis'"
+              - "config:system:set redis host --value localhost"
+              - "config:system:set redis port --value 6379"
+            changed_when: false
+
+          - name: Surface admin credentials for the operator
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              content: |
+                Nextcloud admin login
+                URL:      http://<host>/
+                Username: admin
+                Password: {{ admin_pass.stdout }}
+              mode: '0644'
+            ignore_errors: yes
+
+          - name: Enable required Apache modules
+            command: "a2enmod {{ item }}"
+            loop:
+              - rewrite
+              - headers
+              - env
+              - dir
+              - mime
+              - setenvif
+            changed_when: false
+
+          - name: Enable Nextcloud site and disable default vhost
+            command: "{{ item }}"
+            loop:
+              - a2ensite nextcloud
+              - a2dissite 000-default
+            ignore_errors: yes
+
+          - name: Restart Apache to serve Nextcloud
+            service:
+              name: apache2
+              state: restarted
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/nextcloud/opt/cloudstack/nextcloud_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/nextcloud/opt/cloudstack/nextcloud_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/nextcloud_cleanup.sh && /opt/cloudstack/nextcloud_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
