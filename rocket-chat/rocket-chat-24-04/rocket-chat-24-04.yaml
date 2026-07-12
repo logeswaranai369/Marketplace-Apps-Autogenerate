@@ -1,0 +1,320 @@
+- name: Rocket.Chat Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Rocket.Chat
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating rocketchat_admin_pass
+            shell: openssl rand -hex 24
+            register: rocketchat_admin_pass
+
+          - name: Storing rocketchat_admin_pass
+            copy:
+              dest: "/root/.rocketchat_admin_pass"
+              content: |
+                rocketchat_admin_pass = "{{ rocketchat_admin_pass.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Add NodeSource GPG key for Node.js 22
+            shell: |
+              set -o pipefail
+              curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
+              chmod 0644 /usr/share/keyrings/nodesource.gpg
+            args:
+              executable: /bin/bash
+              creates: /usr/share/keyrings/nodesource.gpg
+
+          - name: Add NodeSource repository (Node.js 22.x)
+            apt_repository:
+              repo: "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main"
+              filename: nodesource
+              state: present
+
+          - name: Add MongoDB 8.0 GPG key
+            shell: |
+              set -o pipefail
+              curl -fsSL https://pgp.mongodb.com/server-8.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+              chmod 0644 /usr/share/keyrings/mongodb-server-8.0.gpg
+            args:
+              executable: /bin/bash
+              creates: /usr/share/keyrings/mongodb-server-8.0.gpg
+
+          - name: Add MongoDB 8.0 repository (codename derived at runtime)
+            apt_repository:
+              repo: "deb [ signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu {{ ansible_distribution_release }}/mongodb-org/8.0 multiverse"
+              filename: mongodb-org-8.0
+              state: present
+
+          - name: Refresh apt cache after adding repositories
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Install base build/tooling packages
+            apt:
+              name:
+                - curl
+                - gnupg
+                - ca-certificates
+                - build-essential
+                - graphicsmagick
+              state: latest
+              lock_timeout: 300
+
+          - name: Install Node.js 22 from NodeSource
+            apt:
+              name: nodejs
+              state: latest
+              lock_timeout: 300
+
+          - name: Install MongoDB 8.0 server
+            apt:
+              name: mongodb-org
+              state: latest
+              lock_timeout: 300
+
+          - name: Configure MongoDB with replica set rs0 (Rocket.Chat requires oplog)
+            debug:
+              msg: "Writing /etc/mongod.conf with replication.replSetName rs0"
+
+          - name: Write /etc/mongod.conf (replica set enabled)
+            copy:
+              dest: /etc/mongod.conf
+              owner: root
+              group: root
+              mode: '0644'
+              content: |
+                # mongod.conf
+
+                storage:
+                  dbPath: /var/lib/mongodb
+
+                systemLog:
+                  destination: file
+                  logAppend: true
+                  path: /var/log/mongodb/mongod.log
+
+                net:
+                  port: 27017
+                  bindIp: 127.0.0.1
+
+                processManagement:
+                  timeZoneInfo: /usr/share/zoneinfo
+
+                replication:
+                  replSetName: rs0
+
+          - name: Enable and (re)start mongod
+            service:
+              name: mongod
+              state: restarted
+              enabled: yes
+
+          - name: Wait for MongoDB to accept connections
+            wait_for:
+              port: 27017
+              host: 127.0.0.1
+              timeout: 120
+
+          - name: Initiate replica set rs0 (idempotent)
+            shell: |
+              mongosh --quiet --eval 'try { rs.status().ok } catch(e) { rs.initiate() }'
+            args:
+              executable: /bin/bash
+            register: rs_init
+            changed_when: false
+            failed_when: false
+
+          - name: Wait until MongoDB node is PRIMARY (writable)
+            shell: |
+              mongosh --quiet --eval 'db.hello().isWritablePrimary'
+            args:
+              executable: /bin/bash
+            register: rs_primary
+            until: rs_primary.stdout is search('true')
+            retries: 30
+            delay: 5
+            changed_when: false
+
+          - name: Create rocketchat system user
+            user:
+              name: rocketchat
+              system: yes
+              create_home: no
+              shell: /usr/sbin/nologin
+            register: rc_user
+
+          - name: Download Rocket.Chat 8.6.1 bundle
+            debug:
+              msg: "Fetching Rocket.Chat 8.6.1 prebuilt Node bundle"
+
+          - name: Check if Rocket.Chat is already deployed
+            stat:
+              path: /opt/Rocket.Chat/main.js
+            register: rc_installed
+
+          - name: Download Rocket.Chat 8.6.1 tarball
+            get_url:
+              url: https://releases.rocket.chat/8.6.1/download
+              dest: /tmp/rocket.chat-8.6.1.tgz
+              mode: '0644'
+            when: not rc_installed.stat.exists
+
+          - name: Extract Rocket.Chat bundle to /opt
+            unarchive:
+              src: /tmp/rocket.chat-8.6.1.tgz
+              dest: /opt/
+              remote_src: yes
+            when: not rc_installed.stat.exists
+
+          - name: Move extracted bundle to /opt/Rocket.Chat
+            command: mv /opt/bundle /opt/Rocket.Chat
+            args:
+              creates: /opt/Rocket.Chat/main.js
+            when: not rc_installed.stat.exists
+
+          - name: Check if server dependencies are installed
+            stat:
+              path: /opt/Rocket.Chat/programs/server/node_modules
+            register: rc_node_modules
+
+          - name: Install Rocket.Chat server dependencies (slow)
+            command: npm install --omit=dev
+            args:
+              chdir: /opt/Rocket.Chat/programs/server
+            when: not rc_node_modules.stat.exists
+
+          - name: Set ownership of Rocket.Chat directory
+            file:
+              path: /opt/Rocket.Chat
+              owner: rocketchat
+              group: rocketchat
+              recurse: yes
+
+          - name: Deploy Rocket.Chat systemd unit (with auto-admin provisioning)
+            debug:
+              msg: "Writing /etc/systemd/system/rocketchat.service"
+
+          - name: Write Rocket.Chat systemd unit
+            copy:
+              dest: /etc/systemd/system/rocketchat.service
+              owner: root
+              group: root
+              mode: '0644'
+              content: |
+                [Unit]
+                Description=Rocket.Chat server
+                After=network.target mongod.service
+                Requires=mongod.service
+
+                [Service]
+                Type=simple
+                User=rocketchat
+                Environment=MONGO_URL=mongodb://localhost:27017/rocketchat?replicaSet=rs0
+                Environment=MONGO_OPLOG_URL=mongodb://localhost:27017/local?replicaSet=rs0
+                Environment=ROOT_URL=http://localhost:3000
+                Environment=PORT=3000
+                Environment=NODE_ENV=production
+                Environment=ADMIN_USERNAME=admin
+                Environment=ADMIN_PASS={{ rocketchat_admin_pass.stdout }}
+                Environment=ADMIN_EMAIL=admin@localhost
+                Environment=OVERWRITE_SETTING_Show_Setup_Wizard=completed
+                ExecStart=/usr/bin/node /opt/Rocket.Chat/main.js
+                Restart=always
+
+                [Install]
+                WantedBy=multi-user.target
+
+          - name: Reload systemd and enable + start Rocket.Chat
+            systemd:
+              name: rocketchat
+              daemon_reload: yes
+              enabled: yes
+              state: started
+
+          - name: Allow Rocket.Chat port 3000 through firewall
+            ufw:
+              rule: allow
+              port: '3000'
+              proto: tcp
+            failed_when: false
+
+          - name: Wait for Rocket.Chat to listen on port 3000 (first-boot warm-up)
+            wait_for:
+              port: 3000
+              host: 127.0.0.1
+              timeout: 300
+
+          - name: Wait for Rocket.Chat HTTP endpoint to serve 200
+            uri:
+              url: http://localhost:3000/
+              status_code: 200
+              return_content: no
+            register: rc_http
+            until: rc_http.status == 200
+            retries: 40
+            delay: 10
+
+          - name: Write credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0644'
+              content: |
+                Rocket.Chat
+                Web UI:   http://<server-ip>:3000/
+                Admin user:     admin
+                Admin password: {{ rocketchat_admin_pass.stdout }}
+                Admin email:    admin@localhost
+
+                App dir:  /opt/Rocket.Chat
+                Service:  systemctl status rocketchat
+                Logs:     journalctl -u rocketchat -f
+                Database: MongoDB 8.0 single-node replica set rs0 (mongodb://localhost:27017/rocketchat)
+
+                PRODUCTION: set ROOT_URL to your real https URL, put Rocket.Chat behind
+                nginx/Apache with TLS proxying to 127.0.0.1:3000, and change the admin password.
+            failed_when: false
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/rocket-chat-24-04/opt/cloudstack/rocket-chat-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/rocket-chat-24-04/opt/cloudstack/rocket-chat-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/rocket-chat-24-04_cleanup.sh && /opt/cloudstack/rocket-chat-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
