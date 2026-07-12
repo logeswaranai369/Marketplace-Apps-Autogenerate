@@ -1,0 +1,156 @@
+- name: BigBlueButton Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure BigBlueButton
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages for BigBlueButton installer
+            apt:
+              name:
+                - ca-certificates
+                - gnupg
+                - curl
+                - wget
+                - openssl
+                - net-tools
+                - dnsutils
+              state: latest
+              lock_timeout: 300
+
+          - name: Map placeholder hostname bbb.local to loopback (installer skips DNS check with -d)
+            lineinfile:
+              path: /etc/hosts
+              line: "127.0.0.1 bbb.local"
+              state: present
+
+          - name: Ensure provided-certificate directory exists
+            file:
+              path: /local/certs
+              state: directory
+              mode: '0755'
+
+          - name: Debug - generating self-signed certificate for install-only image
+            debug:
+              msg: "Generating self-signed cert for bbb.local in /local/certs (replaced by customer's Let's Encrypt cert post-deploy)"
+
+          # bbb-install.sh -d expects fullchain.pem + privkey.pem in /local/certs/. We generate a
+          # self-signed pair so the DNS + Let's Encrypt path is fully bypassed on a fresh marketplace
+          # VM with no public DNS. The customer re-runs the installer with -s <domain> -e <email>
+          # post-deploy to obtain a trusted cert. Idempotent via creates:.
+          - name: Generate self-signed certificate for bbb.local
+            command: >
+              openssl req -x509 -newkey rsa:4096 -nodes -days 3650
+              -subj "/CN=bbb.local"
+              -keyout /local/certs/privkey.pem
+              -out /local/certs/fullchain.pem
+            args:
+              creates: /local/certs/fullchain.pem
+
+          - name: Debug - downloading official bbb-install.sh (v4.0.x-release)
+            debug:
+              msg: "Downloading bbb-install.sh from the bigbluebutton/bbb-install v4.0.x-release branch"
+
+          - name: Download official BigBlueButton installer
+            get_url:
+              url: https://raw.githubusercontent.com/bigbluebutton/bbb-install/v4.0.x-release/bbb-install.sh
+              dest: /tmp/bbb-install.sh
+              mode: '0755'
+
+          - name: Check whether BigBlueButton is already installed
+            stat:
+              path: /usr/bin/bbb-conf
+            register: bbb_installed
+
+          - name: Debug - running BigBlueButton installer (long-running, ~20-30 min)
+            debug:
+              msg: "Running bbb-install.sh non-interactively (noble-400, self-signed cert, hostname bbb.local). This downloads ~1.5GB and may take 20-30 minutes."
+            when: not bbb_installed.stat.exists
+
+          # -v noble-400 : BBB 4.0 beta for Ubuntu 24.04 (noble)
+          # -s bbb.local : placeholder hostname (mapped to loopback above)
+          # -d           : PROVIDED_CERTIFICATE=true -> skip DNS check + Let's Encrypt, use /local/certs
+          # Non-interactive; installs ~313 packages, Docker, FreeSWITCH, bbb-html5.
+          - name: Install BigBlueButton via official installer (install-only, self-signed cert)
+            command: bash /tmp/bbb-install.sh -v noble-400 -s bbb.local -d
+            args:
+              creates: /usr/bin/bbb-conf
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+
+          - name: Debug - ensuring core BigBlueButton services are enabled and running
+            debug:
+              msg: "Enabling and starting nginx, bbb-html5 and freeswitch"
+
+          - name: Ensure BigBlueButton core services are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - nginx
+              - bbb-html5
+              - freeswitch
+            ignore_errors: yes
+
+          # Real functional check: the BBB API endpoint proves the whole WebRTC stack is up, not just
+          # nginx. Self-signed cert -> validate_certs=no. Gate on the SUCCESS return-code marker.
+          # Retries because the full stack (bbb-web, freeswitch, html5) takes time to settle after install.
+          - name: Verify BigBlueButton API responds with SUCCESS
+            uri:
+              url: https://bbb.local/bigbluebutton/api
+              validate_certs: no
+              return_content: yes
+            register: bbb_api
+            until: bbb_api.status == 200 and '<returncode>SUCCESS</returncode>' in (bbb_api.content | default(''))
+            retries: 30
+            delay: 15
+
+          - name: Debug - BigBlueButton install complete
+            debug:
+              msg: "BigBlueButton 4.0 installed with self-signed cert on bbb.local. Customer must point DNS at this server's public IP and re-run the installer with -s <domain> -e <email> -w -g for a trusted cert + Greenlight, and open UDP 16384-32768 for media."
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/bigbluebutton-24-04/opt/cloudstack/bigbluebutton-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/bigbluebutton-24-04/opt/cloudstack/bigbluebutton-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/bigbluebutton-24-04_cleanup.sh && /opt/cloudstack/bigbluebutton-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
