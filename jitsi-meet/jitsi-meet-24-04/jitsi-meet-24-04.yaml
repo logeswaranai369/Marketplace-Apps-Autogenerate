@@ -1,0 +1,277 @@
+- name: Jitsi Meet Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Jitsi Meet
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Map meet.local hostname (must NOT be localhost - Prosody ships VirtualHost localhost)
+            lineinfile:
+              path: /etc/hosts
+              line: "127.0.0.1 meet.local"
+              state: present
+
+          - name: Install base prerequisites
+            apt:
+              name:
+                - apt-transport-https
+                - ca-certificates
+                - gnupg
+                - curl
+                - lua5.4
+              state: latest
+              lock_timeout: 300
+
+          - name: Download Prosody repository signing key
+            get_url:
+              url: https://prosody.im/files/prosody-debian-packages.key
+              dest: /tmp/prosody-debian-packages.key
+              mode: '0644'
+
+          - name: Install Prosody keyring
+            shell: gpg --dearmor -o /usr/share/keyrings/prosody-debian-packages.gpg /tmp/prosody-debian-packages.key
+            args:
+              creates: /usr/share/keyrings/prosody-debian-packages.gpg
+
+          - name: Add Prosody apt repository
+            apt_repository:
+              repo: "deb [signed-by=/usr/share/keyrings/prosody-debian-packages.gpg] http://packages.prosody.im/debian {{ ansible_distribution_release }} main"
+              filename: prosody
+              state: present
+
+          - name: Download Jitsi repository signing key
+            get_url:
+              url: https://download.jitsi.org/jitsi-key.gpg.key
+              dest: /tmp/jitsi-key.gpg.key
+              mode: '0644'
+
+          - name: Install Jitsi keyring
+            shell: gpg --dearmor -o /usr/share/keyrings/jitsi-keyring.gpg /tmp/jitsi-key.gpg.key
+            args:
+              creates: /usr/share/keyrings/jitsi-keyring.gpg
+
+          - name: Add Jitsi apt repository (flat 'stable/' repo)
+            apt_repository:
+              repo: "deb [signed-by=/usr/share/keyrings/jitsi-keyring.gpg] https://download.jitsi.org stable/"
+              filename: jitsi-stable
+              state: present
+
+          - name: Ensure universe component is enabled (Jitsi deps live there)
+            command: add-apt-repository -y universe
+            register: universe_add
+            changed_when: "'Adding' in universe_add.stdout or universe_add.rc == 0"
+            failed_when: false
+
+          - name: Update apt cache after adding repos
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Debug - make Lua 5.4 the default interpreter (Prosody 13 refuses Lua 5.1)
+            debug:
+              msg: "Setting lua-interpreter to lua5.4 before installing jitsi-meet"
+
+          - name: Set lua-interpreter to lua5.4
+            command: update-alternatives --set lua-interpreter /usr/bin/lua5.4
+            register: lua_set
+            changed_when: false
+            failed_when: false
+
+          - name: Debug - preseed debconf answers for jitsi-meet
+            debug:
+              msg: "Preseeding jitsi-meet debconf selections (hostname meet.local, self-signed cert)"
+
+          - name: Preseed jitsi-videobridge2 hostname
+            shell: echo "jitsi-videobridge2 jitsi-videobridge/jvb-hostname string meet.local" | debconf-set-selections
+            changed_when: false
+
+          - name: Preseed jitsi-meet-web-config hostname
+            shell: echo "jitsi-meet-web-config jitsi-meet/jvb-hostname string meet.local" | debconf-set-selections
+            changed_when: false
+
+          - name: Preseed jitsi-meet-web-config cert choice (self-signed)
+            shell: echo "jitsi-meet-web-config jitsi-meet/cert-choice select Self-signed certificate will be generated" | debconf-set-selections
+            changed_when: false
+
+          - name: Debug - install the full Jitsi Meet stack
+            debug:
+              msg: "Installing nginx-full, JRE, and the jitsi-meet meta-package non-interactively"
+
+          - name: Install web server and Java runtime
+            apt:
+              name:
+                - nginx-full
+                - openjdk-17-jre-headless
+              state: latest
+              lock_timeout: 300
+
+          - name: Install jitsi-meet meta-package (non-interactive)
+            apt:
+              name: jitsi-meet
+              state: latest
+              lock_timeout: 300
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+
+          - name: Debug - apply Jitsi recommended file/process limits
+            debug:
+              msg: "Appending DefaultLimit settings to /etc/systemd/system.conf"
+
+          - name: Set systemd default limits recommended by Jitsi
+            blockinfile:
+              path: /etc/systemd/system.conf
+              marker: "# {mark} JITSI LIMITS"
+              block: |
+                DefaultLimitNOFILE=65000
+                DefaultLimitNPROC=65000
+                DefaultTasksMax=65000
+            register: sysd_limits
+
+          - name: Reload systemd after limit changes
+            command: systemctl daemon-reload
+            when: sysd_limits.changed
+
+          - name: Ensure Jitsi/nginx services are enabled and started
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - nginx
+              - prosody
+              - jicofo
+              - jitsi-videobridge2
+
+          - name: Debug - verify HTTPS listener on 443, complete vhost if missing
+            debug:
+              msg: "Checking whether port 443 is bound; will finish nginx vhost + cert if not"
+
+          - name: Probe whether anything is listening on 443
+            shell: ss -ltn 'sport = :443' | grep -c LISTEN || true
+            register: p443
+            changed_when: false
+
+          - name: Generate self-signed cert for meet.local (fallback when postinst skipped it)
+            command: >
+              openssl req -x509 -newkey rsa:4096 -nodes -days 3650
+              -subj "/CN=meet.local"
+              -keyout /etc/jitsi/meet/meet.local.key
+              -out /etc/jitsi/meet/meet.local.crt
+            args:
+              creates: /etc/jitsi/meet/meet.local.crt
+            when: p443.stdout | int == 0
+
+          - name: Copy Jitsi nginx vhost template (fallback)
+            copy:
+              src: /usr/share/jitsi-meet-web-config/jitsi-meet.example
+              dest: /etc/nginx/sites-available/meet.local.conf
+              remote_src: yes
+              mode: '0644'
+            when: p443.stdout | int == 0
+
+          - name: Set hostname in fallback vhost
+            replace:
+              path: /etc/nginx/sites-available/meet.local.conf
+              regexp: 'jitsi-meet\.example\.com'
+              replace: 'meet.local'
+            when: p443.stdout | int == 0
+
+          - name: Enable fallback vhost
+            file:
+              src: /etc/nginx/sites-available/meet.local.conf
+              dest: /etc/nginx/sites-enabled/meet.local.conf
+              state: link
+            when: p443.stdout | int == 0
+
+          - name: Test nginx config (fallback)
+            command: nginx -t
+            when: p443.stdout | int == 0
+
+          - name: Restart nginx to bind 443 (fallback)
+            service:
+              name: nginx
+              state: restarted
+            when: p443.stdout | int == 0
+
+          - name: Wait for HTTPS port 443 to be listening
+            wait_for:
+              port: 443
+              timeout: 120
+
+          - name: Debug - verify the Jitsi Meet UI actually serves
+            debug:
+              msg: "Requesting https://meet.local/ (self-signed) to confirm a real 200"
+
+          - name: Verify Jitsi Meet UI returns 200 (self-signed HTTPS)
+            uri:
+              url: https://meet.local/
+              validate_certs: no
+              status_code: 200
+            register: jitsi_serve
+            until: jitsi_serve.status == 200
+            retries: 30
+            delay: 6
+
+          - name: Write credentials / access information
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0644'
+              content: |
+                Jitsi Meet
+                Web UI: https://<server-ip>/
+                  (accept the self-signed certificate warning, then type a room name to start a meeting)
+                Anonymous meetings are enabled by default - there is NO admin login/password.
+
+                Services: nginx, prosody, jicofo, jitsi-videobridge2
+                  systemctl status <name>
+                  journalctl -u <name>
+
+                PRODUCTION NOTES:
+                  - Point a DNS A record at this server and set a real FQDN (replace meet.local).
+                  - Get a CA-signed cert: /usr/share/jitsi-meet/scripts/install-letsencrypt-cert.sh
+                    (mobile/browser clients require a CA-signed certificate; self-signed will not work for them).
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/jitsi-meet-24-04/opt/cloudstack/jitsi-meet-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/jitsi-meet-24-04/opt/cloudstack/jitsi-meet-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/jitsi-meet-24-04_cleanup.sh && /opt/cloudstack/jitsi-meet-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
