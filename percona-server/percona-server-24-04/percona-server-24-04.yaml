@@ -1,0 +1,187 @@
+- name: Percona Server for MySQL Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Percona Server for MySQL
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating mysql_root_password
+            shell: openssl rand -hex 24
+            register: mysql_root_password
+
+          - name: Storing mysql_root_password
+            copy:
+              dest: "/root/.mysql_root_password"
+              content: |
+                mysql_root_password = "{{ mysql_root_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages
+            debug:
+              msg: "Installing prerequisite packages for Percona Server 8.4"
+
+          - name: Install prerequisites
+            apt:
+              name:
+                - curl
+                - gnupg2
+                - lsb-release
+                - ca-certificates
+                - python3-pymysql
+              state: latest
+              lock_timeout: 300
+
+          - name: Download percona-release setup package
+            get_url:
+              url: https://repo.percona.com/apt/percona-release_latest.generic_all.deb
+              dest: /tmp/percona-release_latest.generic_all.deb
+              mode: '0644'
+
+          - name: Install percona-release package
+            apt:
+              deb: /tmp/percona-release_latest.generic_all.deb
+              state: present
+              lock_timeout: 300
+
+          - name: Enable Percona Server 8.4 LTS repository
+            debug:
+              msg: "Enabling ps-84-lts repository via percona-release"
+
+          - name: Configure ps-84-lts repository
+            command: percona-release setup ps-84-lts --scheme https
+            args:
+              creates: /etc/apt/sources.list.d/percona-ps-84-lts.list
+
+          - name: Update apt cache after adding Percona repo
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Preseed debconf for non-interactive Percona Server install
+            debug:
+              msg: "Preseeding debconf so percona-server-server installs without a TTY prompt"
+
+          - name: Preseed root password (initial)
+            debconf:
+              name: percona-server-server
+              question: percona-server-server/root-pass
+              vtype: password
+              value: "{{ mysql_root_password.stdout }}"
+            no_log: true
+
+          - name: Preseed root password (confirm)
+            debconf:
+              name: percona-server-server
+              question: percona-server-server/re-root-pass
+              vtype: password
+              value: "{{ mysql_root_password.stdout }}"
+            no_log: true
+
+          - name: Preseed default authentication plugin choice
+            debconf:
+              name: percona-server-server
+              question: percona-server-server/default-auth-override
+              vtype: select
+              value: "Use Strong Password Encryption (RECOMMENDED)"
+
+          - name: Install Percona Server for MySQL 8.4
+            debug:
+              msg: "Installing percona-server-server (Percona Server 8.4 LTS)"
+
+          - name: Install percona-server-server
+            apt:
+              name: percona-server-server
+              state: present
+              lock_timeout: 300
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+
+          - name: Ensure MySQL (Percona) service is enabled and running
+            debug:
+              msg: "Enabling and starting the mysql service"
+
+          - name: Enable and start mysql service
+            systemd:
+              name: mysql
+              enabled: yes
+              state: started
+
+          - name: Wait for classic MySQL protocol port 3306
+            wait_for:
+              host: 127.0.0.1
+              port: 3306
+              timeout: 60
+
+          - name: Verify root authentication with generated password
+            command: mysql -uroot -p{{ mysql_root_password.stdout }} -e "SELECT VERSION();"
+            register: mysql_version_check
+            changed_when: false
+            no_log: true
+
+          - name: Assert Percona Server 8.4 responds to authenticated root
+            assert:
+              that:
+                - mysql_version_check.rc == 0
+                - "'8.4' in mysql_version_check.stdout"
+              fail_msg: "Percona Server root authentication or version check failed"
+              success_msg: "Percona Server 8.4 root authentication verified"
+
+          - name: Write credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0644'
+              content: |
+                Percona Server for MySQL 8.4 (LTS)
+                Root user: root
+                Root password: {{ mysql_root_password.stdout }}
+                Connect (socket): mysql -uroot -p
+                Connect (TCP):    mysql -uroot -p -h127.0.0.1 -P3306
+                Service:  systemctl status mysql
+                Config:   /etc/mysql/
+                Data dir: /var/lib/mysql
+                Logs:     journalctl -u mysql
+                Ports:    3306 (classic), 33060 (X protocol)
+            no_log: true
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/percona-server-24-04/opt/cloudstack/percona-server-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/percona-server-24-04/opt/cloudstack/percona-server-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/percona-server-24-04_cleanup.sh && /opt/cloudstack/percona-server-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
