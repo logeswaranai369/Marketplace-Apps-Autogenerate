@@ -1,0 +1,165 @@
+- name: Grafana Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Grafana
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating grafana_admin_password
+            shell: openssl rand -hex 24
+            register: grafana_admin_password
+
+          - name: Storing grafana_admin_password
+            copy:
+              dest: "/root/.grafana_admin_password"
+              content: |
+                grafana_admin_password = "{{ grafana_admin_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Ensure apt keyrings directory exists
+            file:
+              path: /etc/apt/keyrings
+              state: directory
+              mode: '0755'
+
+          - name: Download Grafana APT signing key
+            shell: |
+              wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor > /etc/apt/keyrings/grafana.gpg
+            args:
+              creates: /etc/apt/keyrings/grafana.gpg
+
+          - name: Add Grafana APT repository
+            copy:
+              dest: /etc/apt/sources.list.d/grafana.list
+              content: "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main\n"
+              mode: '0644'
+            register: grafana_repo
+
+          - name: Update apt cache after adding Grafana repo
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+            when: grafana_repo.changed
+
+          - name: Install prerequisite packages
+            apt:
+              name:
+                - apt-transport-https
+                - ca-certificates
+                - curl
+                - wget
+                - gnupg
+              state: latest
+              lock_timeout: 300
+
+          - name: Install Grafana OSS
+            apt:
+              name: grafana
+              state: latest
+              lock_timeout: 300
+
+          - name: Create systemd drop-in directory for grafana-server
+            file:
+              path: /etc/systemd/system/grafana-server.service.d
+              state: directory
+              mode: '0755'
+
+          # Inject the generated admin password via a systemd env override so grafana-server applies it
+          # itself ON FIRST START as the grafana user. Never run `grafana cli reset-admin-password` as
+          # root before first start — it would create /var/lib/grafana/grafana.db owned root:root while
+          # the service runs as User=grafana, causing "unable to open database file (14)" crash-loop.
+          - name: Render systemd env override with generated admin password
+            copy:
+              dest: /etc/systemd/system/grafana-server.service.d/override.conf
+              content: |
+                [Service]
+                Environment=GF_SECURITY_ADMIN_PASSWORD={{ grafana_admin_password.stdout }}
+              mode: '0644'
+
+          - name: Reload systemd to pick up the override
+            systemd:
+              daemon_reload: yes
+
+          - name: Enable and start grafana-server
+            service:
+              name: grafana-server
+              state: started
+              enabled: yes
+
+          - name: Wait for Grafana to bind port 3000 (bundled-plugin warmup ~20-30s)
+            wait_for:
+              host: 127.0.0.1
+              port: 3000
+              state: started
+              timeout: 180
+
+          - name: Verify Grafana health endpoint returns 200 (retry over first-start warmup)
+            uri:
+              url: http://localhost:3000/api/health
+              status_code: 200
+              return_content: yes
+            register: grafana_health
+            until: grafana_health.status == 200
+            retries: 30
+            delay: 6
+
+          - name: Write credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0644'
+              content: |
+                Grafana OSS
+                Web UI        : http://<server-ip>:3000/
+                Admin user    : admin
+                Admin password: {{ grafana_admin_password.stdout }}
+
+                Config        : /etc/grafana/grafana.ini
+                Data          : /var/lib/grafana
+                Service       : systemctl status grafana-server
+                Logs          : journalctl -u grafana-server -f  and /var/log/grafana/
+
+                NOTE: Change the admin password on first login. Put Grafana behind a
+                TLS reverse proxy for production and restrict :3000 to trusted networks.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/grafana-24-04/opt/cloudstack/grafana-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/grafana-24-04/opt/cloudstack/grafana-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/grafana-24-04_cleanup.sh && /opt/cloudstack/grafana-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
