@@ -1,0 +1,100 @@
+- name: 360 Monitoring (agent360) Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure 360 Monitoring (agent360)
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages
+            apt:
+              name:
+                - wget
+                - ca-certificates
+              state: latest
+              lock_timeout: 300
+
+          - name: Notify about agent360 installer download
+            debug:
+              msg: "Downloading the official 360 Monitoring agent360 installer"
+
+          - name: Download the official agent360 installer
+            get_url:
+              url: https://monitoring.platform360.io/agent360.sh
+              dest: /tmp/agent360.sh
+              mode: '0755'
+
+          - name: Check if agent360 is already installed
+            stat:
+              path: /usr/local/bin/agent360
+            register: agent360_bin
+
+          - name: Notify about agent360 installation
+            debug:
+              msg: "Running the agent360 installer non-interactively with a placeholder token (BYO-token model — customer applies their own USERTOKEN post-deploy)"
+
+          # The installer pulls its own build deps (python3-dev/venv/pip/gcc), installs the agent to
+          # /usr/local/bin/agent360, and creates + enables + starts the agent360 systemd unit. The
+          # cloud-registration step (hello360) fails NON-fatally on the placeholder token, so the
+          # install still completes and the service starts. Do NOT hardcode a real token — that is a
+          # post-deploy customer step. failed_when: false because hello360 returns non-zero on the
+          # placeholder but the agent itself installs and starts fine.
+          - name: Install agent360 with a placeholder token
+            shell: bash /tmp/agent360.sh CHANGEME
+            register: agent360_install
+            failed_when: false
+            when: not agent360_bin.stat.exists
+
+          - name: Notify about enabling the agent360 service
+            debug:
+              msg: "Ensuring the agent360 service is enabled and running"
+
+          - name: Ensure agent360 service is enabled and started
+            service:
+              name: agent360
+              state: started
+              enabled: yes
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/360-monitoring-24-04/opt/cloudstack/360-monitoring-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/360-monitoring-24-04/opt/cloudstack/360-monitoring-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/360-monitoring-24-04_cleanup.sh && /opt/cloudstack/360-monitoring-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
