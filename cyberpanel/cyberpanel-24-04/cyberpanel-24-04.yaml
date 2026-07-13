@@ -1,0 +1,151 @@
+- name: CyberPanel Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure CyberPanel
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating cyberpanel_admin_password
+            shell: openssl rand -hex 24
+            register: cyberpanel_admin_password
+
+          - name: Storing cyberpanel_admin_password
+            copy:
+              dest: "/root/.cyberpanel_admin_password"
+              content: |
+                cyberpanel_admin_password = "{{ cyberpanel_admin_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install CyberPanel prerequisites
+            apt:
+              name:
+                - curl
+                - wget
+                - ca-certificates
+              state: latest
+              lock_timeout: 300
+
+          - name: Persist generated admin password to its store file (0600)
+            copy:
+              dest: /root/.cyberpanel_admin_password
+              content: "cyberpanel_admin_password = \"{{ cyberpanel_admin_password.stdout }}\"\n"
+              owner: root
+              group: root
+              mode: '0600'
+
+          - name: Fetch the CyberPanel OS-specific installer wrapper
+            command: curl -s -o /root/cyberpanel.sh "https://cyberpanel.sh/?dl&Ubuntu"
+            args:
+              creates: /root/cyberpanel.sh
+
+          - name: Ensure installer wrapper is executable
+            file:
+              path: /root/cyberpanel.sh
+              mode: '0755'
+
+          - name: Notify start of CyberPanel install (LONG, ~15-25 min)
+            debug:
+              msg: "Starting CyberPanel OpenLiteSpeed-edition install via clean root env (no SUDO_* vars). This takes 15-25 minutes."
+
+          # CyberPanel's Check_Root aborts if SUDO_* env vars are present, even when already root.
+          # `su - root -c` gives a login shell that DROPS SUDO_USER/SUDO_UID/SUDO_COMMAND, so the
+          # installer's root-check passes. -v ols = OpenLiteSpeed free edition + Silent=On (no prompts).
+          - name: Run CyberPanel installer in a clean root environment
+            command: su - root -c "bash /root/cyberpanel.sh -v ols -p {{ cyberpanel_admin_password.stdout }}"
+            args:
+              creates: /usr/local/CyberCP/manage.py
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+            async: 2400
+            poll: 0
+            register: cp_install
+
+          - name: Wait for CyberPanel installer to finish (poll async job)
+            async_status:
+              jid: "{{ cp_install.ansible_job_id }}"
+            register: cp_job
+            until: cp_job.finished
+            retries: 120
+            delay: 20
+            when: cp_install.ansible_job_id is defined
+
+          - name: Assert CyberPanel install marker exists (real success check)
+            stat:
+              path: /usr/local/CyberCP/manage.py
+            register: cp_marker
+
+          - name: Fail if CyberPanel did not install
+            assert:
+              that:
+                - cp_marker.stat.exists
+              fail_msg: "CyberPanel install did not complete (/usr/local/CyberCP/manage.py missing)."
+              success_msg: "CyberPanel install marker present."
+
+          - name: Ensure lscpd panel service is enabled and running
+            systemd:
+              name: lscpd
+              enabled: yes
+              state: started
+
+          - name: Wait for panel port 8090 to accept connections
+            wait_for:
+              host: 127.0.0.1
+              port: 8090
+              timeout: 180
+
+          - name: Verify the panel actually SERVES over self-signed HTTPS (real serve check)
+            uri:
+              url: https://localhost:8090/
+              validate_certs: no
+              status_code: 200
+            register: r
+            until: r.status == 200
+            retries: 30
+            delay: 6
+
+          - name: Show CyberPanel access summary
+            debug:
+              msg: "CyberPanel ready at https://<server-ip>:8090/  (login: admin / password stored in /root/.cyberpanel_admin_password)"
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/cyberpanel-24-04/opt/cloudstack/cyberpanel-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/cyberpanel-24-04/opt/cloudstack/cyberpanel-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/cyberpanel-24-04_cleanup.sh && /opt/cloudstack/cyberpanel-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
