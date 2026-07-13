@@ -1,0 +1,275 @@
+- name: Discourse Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Discourse
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating discourse_admin_password
+            shell: openssl rand -hex 24
+            register: discourse_admin_password
+
+          - name: Storing discourse_admin_password
+            copy:
+              dest: "/root/.discourse_admin_password"
+              content: |
+                discourse_admin_password = "{{ discourse_admin_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install base packages (git, curl, ca-certificates)
+            apt:
+              name:
+                - git
+                - curl
+                - ca-certificates
+              state: latest
+              lock_timeout: 300
+
+          - name: Check if Docker is already installed
+            stat:
+              path: /usr/bin/docker
+            register: docker_bin
+
+          - name: Download Docker convenience install script
+            get_url:
+              url: https://get.docker.com
+              dest: /tmp/get-docker.sh
+              mode: '0755'
+            when: not docker_bin.stat.exists
+
+          - name: Install Docker via official convenience script
+            command: sh /tmp/get-docker.sh
+            args:
+              creates: /usr/bin/docker
+            when: not docker_bin.stat.exists
+
+          - name: Ensure Docker is enabled and running
+            service:
+              name: docker
+              state: started
+              enabled: yes
+
+          - name: Clone discourse_docker launcher
+            debug:
+              msg: "Cloning discourse_docker into /var/discourse"
+
+          - name: Clone discourse_docker repository
+            git:
+              repo: https://github.com/discourse/discourse_docker.git
+              dest: /var/discourse
+              depth: 1
+              version: main
+            register: discourse_clone
+            # guard: only clones if /var/discourse is not already a repo
+            when: not (ansible_check_mode | default(false))
+            changed_when: discourse_clone.changed
+
+          - name: Ensure containers directory exists
+            file:
+              path: /var/discourse/containers
+              state: directory
+              mode: '0755'
+
+          # Write the container definition DIRECTLY (bypass the interactive ./discourse-setup).
+          # SSL / Let's Encrypt templates are deliberately OMITTED: the placeholder hostname has no
+          # public DNS, so LE would issue zero-byte certs and crash-loop nginx (:80/:443 accept but
+          # RESET, curl 000). TLS is a post-deploy step. Contains NO secret values.
+          - name: Deploy Discourse app.yml container definition
+            copy:
+              dest: /var/discourse/containers/app.yml
+              mode: '0644'
+              content: |
+                templates:
+                  - "templates/postgres.template.yml"
+                  - "templates/redis.template.yml"
+                  - "templates/web.template.yml"
+                  - "templates/web.ratelimited.template.yml"
+
+                expose:
+                  - "80:80"   # http
+                  - "443:443" # https
+
+                params:
+                  db_default_text_search_config: "pg_catalog.english"
+                  db_shared_buffers: "256MB"
+
+                env:
+                  LANG: en_US.UTF-8
+                  UNICORN_WORKERS: 4
+
+                  DISCOURSE_HOSTNAME: 'discourse.local'
+                  DISCOURSE_DEVELOPER_EMAILS: 'admin@discourse.local'
+
+                  DISCOURSE_SMTP_ADDRESS: localhost
+                  DISCOURSE_SMTP_USER_NAME: ""
+                  DISCOURSE_SMTP_PASSWORD: ""
+
+                  DISCOURSE_SKIP_EMAIL_SETUP: "1"
+
+                volumes:
+                  - volume:
+                      host: /var/discourse/shared/standalone
+                      guest: /shared
+                  - volume:
+                      host: /var/discourse/shared/standalone/log/var-log
+                      guest: /var/log
+
+                hooks:
+                  after_code:
+                    - exec:
+                        cd: $home/plugins
+                        cmd:
+                          - git clone --depth 1 https://github.com/discourse/docker_manager.git
+
+                run:
+                  - exec: echo "Beginning of custom commands"
+                  - exec: echo "End of custom commands"
+
+          - name: Check if Discourse app image is already built
+            shell: docker images -q local_discourse/app
+            register: discourse_image
+            changed_when: false
+
+          - name: Bootstrap Discourse app container (builds ~5.5GB image, 10-15 min)
+            debug:
+              msg: "Bootstrapping Discourse app container - this can take 10-15 minutes"
+            when: discourse_image.stdout == ""
+
+          - name: Run Discourse bootstrap (async)
+            command: ./launcher bootstrap app
+            args:
+              chdir: /var/discourse
+            async: 2400
+            poll: 0
+            register: bootstrap_job
+            when: discourse_image.stdout == ""
+
+          - name: Wait for Discourse bootstrap to finish
+            async_status:
+              jid: "{{ bootstrap_job.ansible_job_id }}"
+            register: bootstrap_result
+            until: bootstrap_result.finished
+            retries: 160
+            delay: 15
+            when: discourse_image.stdout == ""
+            failed_when: bootstrap_result.finished and bootstrap_result.rc != 0
+
+          - name: Check if Discourse container is already running
+            shell: docker ps -q -f name=app -f status=running
+            register: app_running
+            changed_when: false
+
+          - name: Start Discourse app container
+            debug:
+              msg: "Starting Discourse app container (--restart=always)"
+            when: app_running.stdout == ""
+
+          - name: Start Discourse app container
+            command: ./launcher start app
+            args:
+              chdir: /var/discourse
+            when: app_running.stdout == ""
+
+          - name: Wait for Discourse HTTP port to accept connections
+            wait_for:
+              host: 127.0.0.1
+              port: 80
+              timeout: 180
+
+          - name: Wait for Discourse liveness endpoint to serve 200
+            uri:
+              url: http://localhost/srv/status
+              return_content: yes
+              status_code: 200
+            register: srv_status
+            until: srv_status.status == 200 and 'ok' in (srv_status.content | default(''))
+            retries: 20
+            delay: 15
+            failed_when: false
+
+          # Admin is created programmatically because DISCOURSE_SKIP_EMAIL_SETUP=1 disables email signup.
+          # Run as the 'discourse' user inside the container (root hits git 'dubious ownership' errors).
+          - name: Write mkadmin.rb into the shared volume
+            copy:
+              dest: /var/discourse/shared/standalone/mkadmin.rb
+              mode: '0644'
+              content: |
+                u = User.find_by_email("admin@discourse.local") ||
+                    User.new(email:"admin@discourse.local", username:"admin", name:"Administrator")
+                u.password = ENV["ADMPW"]; u.active = true; u.approved = true; u.save!
+                u.grant_admin!; u.change_trust_level!(1) if u.trust_level < 1
+                u.email_tokens.update_all(confirmed:true); u.activate
+
+          - name: Create Discourse admin user
+            debug:
+              msg: "Creating Discourse admin user 'admin'"
+
+          - name: Run mkadmin.rb inside the container to create the admin
+            command: >
+              docker exec -e ADMPW={{ discourse_admin_password.stdout }} -u discourse app
+              bash -c 'cd /var/www/discourse && RAILS_ENV=production bin/rails runner /shared/mkadmin.rb'
+            register: mkadmin_result
+            until: mkadmin_result.rc == 0
+            retries: 20
+            delay: 15
+            changed_when: mkadmin_result.rc == 0
+
+          - name: Write operator credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0644'
+              content: |
+                Discourse access URL : http://{{ ansible_default_ipv4.address | default('SERVER_IP') }}/
+                Admin username       : admin
+                Admin password       : {{ discourse_admin_password.stdout }}
+
+                POST-DEPLOY NOTE:
+                Signups, password-reset emails and HTTPS are NOT active yet. Before enabling them you must
+                set a real DISCOURSE_HOSTNAME + SMTP settings and (optionally) re-enable the SSL/Let's
+                Encrypt templates by editing /var/discourse/containers/app.yml, then run:
+                  cd /var/discourse && ./launcher rebuild app
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/discourse-24-04/opt/cloudstack/discourse-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/discourse-24-04/opt/cloudstack/discourse-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/discourse-24-04_cleanup.sh && /opt/cloudstack/discourse-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
