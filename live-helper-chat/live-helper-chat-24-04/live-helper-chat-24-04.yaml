@@ -1,0 +1,271 @@
+- name: Live Helper Chat Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Live Helper Chat
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating generated_db_password
+            shell: openssl rand -hex 24
+            register: generated_db_password
+
+          - name: Storing generated_db_password
+            copy:
+              dest: "/root/.generated_db_password"
+              content: |
+                generated_db_password = "{{ generated_db_password.stdout }}"
+          - name: Generating lhc_admin_password
+            shell: openssl rand -hex 24
+            register: lhc_admin_password
+
+          - name: Storing lhc_admin_password
+            copy:
+              dest: "/root/.lhc_admin_password"
+              content: |
+                lhc_admin_password = "{{ lhc_admin_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/live-helper-chat-24-04/etc/apache2/sites-available/lhc.conf', confdest: '/etc/apache2/sites-available/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install Apache web server
+            apt:
+              name:
+                - apache2
+                - libapache2-mod-php
+              state: latest
+              lock_timeout: 300
+
+          - name: Install PHP and required extensions
+            apt:
+              name:
+                - php
+                - php-mysql
+                - php-curl
+                - php-mbstring
+                - php-gd
+                - php-xml
+                - php-zip
+                - php-bcmath
+                - php-intl
+              state: latest
+              lock_timeout: 300
+
+          - name: Install MariaDB and PyMySQL
+            apt:
+              name:
+                - mariadb-server
+                - python3-pymysql
+              state: latest
+              lock_timeout: 300
+
+          - name: Ensure Apache and MariaDB are enabled and running
+            service:
+              name: "{{ item }}"
+              state: started
+              enabled: yes
+            loop:
+              - apache2
+              - mariadb
+
+          - name: Enable Apache rewrite and headers modules
+            command: "a2enmod {{ item }}"
+            loop:
+              - rewrite
+              - headers
+            changed_when: false
+
+          - name: "Create Live Helper Chat database"
+            community.mysql.mysql_db:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: lhc
+              encoding: utf8mb4
+              collation: utf8mb4_unicode_ci
+              state: present
+
+          - name: "Create Live Helper Chat database user"
+            community.mysql.mysql_user:
+              login_unix_socket: /var/run/mysqld/mysqld.sock
+              name: lhc
+              password: "{{ generated_db_password.stdout }}"
+              host: localhost
+              priv: "lhc.*:ALL"
+              state: present
+
+          - name: Download Live Helper Chat 4.87v with-dependencies tarball
+            get_url:
+              url: https://github.com/LiveHelperChat/livehelperchat/releases/download/4.87v/4.87v-with-dependencies.tgz
+              dest: /tmp/lhc-4.87v-with-dependencies.tgz
+              mode: '0644'
+
+          - name: Check if LHC webroot already deployed
+            stat:
+              path: /var/www/lhc/index.php
+            register: lhc_webroot
+
+          - name: Create extraction directory
+            file:
+              path: /tmp/lhc-extract
+              state: directory
+              mode: '0755'
+            when: not lhc_webroot.stat.exists
+
+          - name: Extract LHC tarball
+            unarchive:
+              src: /tmp/lhc-4.87v-with-dependencies.tgz
+              dest: /tmp/lhc-extract
+              remote_src: yes
+            when: not lhc_webroot.stat.exists
+
+          - name: Deploy lhc_web to /var/www/lhc
+            shell: |
+              mkdir -p /var/www/lhc
+              cp -a /tmp/lhc-extract/livehelperchat-master/lhc_web/. /var/www/lhc/
+            args:
+              creates: /var/www/lhc/index.php
+
+          - name: Set ownership of LHC webroot
+            file:
+              path: /var/www/lhc
+              owner: www-data
+              group: www-data
+              recurse: yes
+
+          - name: Ensure LHC writable directories are group/owner writable (wizard hard-checks these)
+            shell: |
+              chmod -R 775 /var/www/lhc/settings /var/www/lhc/cache /var/www/lhc/var
+            changed_when: false
+
+          - name: Disable Apache default site
+            command: a2dissite 000-default
+            register: a2dis
+            changed_when: "'Site 000-default disabled' in a2dis.stdout"
+            failed_when: false
+
+          - name: Enable LHC Apache site
+            command: a2ensite lhc
+            register: a2en
+            changed_when: "'Enabling site lhc' in a2en.stdout"
+
+          - name: Reload Apache to apply configuration
+            service:
+              name: apache2
+              state: reloaded
+
+          - name: Derive admin password within LHC 40-char limit (use first 32 hex chars)
+            set_fact:
+              lhc_admin_pw: "{{ lhc_admin_password.stdout[:32] }}"
+
+          - name: Check if LHC install wizard already completed
+            shell: grep -q "'installed' => true" /var/www/lhc/settings/settings.ini.php
+            register: lhc_installed_check
+            failed_when: false
+            changed_when: false
+
+          - name: "Drive LHC install wizard non-interactively"
+            shell: |
+              set -e
+              base="http://localhost/index.php/site_admin/install/install"
+              cj="/tmp/lhc-wizard-cookies.txt"
+              rm -f "$cj"
+              # Step 1: advance past requirements/permissions
+              curl -s -c "$cj" -b "$cj" --data "Install=Next" "$base/1" >/dev/null
+              # Step 2: database configuration
+              curl -s -c "$cj" -b "$cj" \
+                --data-urlencode "DatabaseHost=localhost" \
+                --data-urlencode "DatabasePort=3306" \
+                --data-urlencode "DatabaseUsername=lhc" \
+                --data-urlencode "DatabasePassword={{ generated_db_password.stdout }}" \
+                --data-urlencode "DatabaseDatabaseName=lhc" \
+                --data-urlencode "Install=Next" "$base/2" >/dev/null
+              # Step 3: admin account
+              curl -s -c "$cj" -b "$cj" \
+                --data-urlencode "AdminUsername=admin" \
+                --data-urlencode "AdminPassword={{ lhc_admin_pw }}" \
+                --data-urlencode "AdminPassword1={{ lhc_admin_pw }}" \
+                --data-urlencode "AdminEmail=admin@example.com" \
+                --data-urlencode "AdminName=Site" \
+                --data-urlencode "AdminSurname=Admin" \
+                --data-urlencode "DefaultDepartament=Support" \
+                --data-urlencode "Install=Next" "$base/3" >/dev/null
+            args:
+              executable: /bin/bash
+            when: lhc_installed_check.rc != 0
+
+          - name: "Verify install by real post-state (lh_users table + installed flag)"
+            shell: |
+              set -e
+              mysql lhc -e "SHOW TABLES LIKE 'lh_users'" | grep -q lh_users
+              grep -q "'installed' => true" /var/www/lhc/settings/settings.ini.php
+            args:
+              executable: /bin/bash
+            register: lhc_verify
+            changed_when: false
+
+          - name: Determine primary IP for credentials file
+            set_fact:
+              lhc_public_ip: "{{ ansible_default_ipv4.address | default('SERVER_IP') }}"
+
+          - name: Write credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                Live Helper Chat
+                URL:            http://{{ lhc_public_ip }}/
+                Admin panel:    http://{{ lhc_public_ip }}/index.php/site_admin
+                Admin username: admin
+                Admin password: {{ lhc_admin_pw }}
+
+                Database name:     lhc
+                Database user:     lhc
+                Database password: {{ generated_db_password.stdout }}
+
+                Note: LHC needs a cron for background jobs (run as www-data):
+                  * * * * * php /var/www/lhc/cron.php -s site_admin -e prod
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/live-helper-chat-24-04/opt/cloudstack/live-helper-chat-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/live-helper-chat-24-04/opt/cloudstack/live-helper-chat-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/live-helper-chat-24-04_cleanup.sh && /opt/cloudstack/live-helper-chat-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
