@@ -1,0 +1,226 @@
+- name: lakeFS Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure lakeFS
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating lakefs_encrypt_key
+            shell: openssl rand -hex 24
+            register: lakefs_encrypt_key
+
+          - name: Storing lakefs_encrypt_key
+            copy:
+              dest: "/root/.lakefs_encrypt_key"
+              content: |
+                lakefs_encrypt_key = "{{ lakefs_encrypt_key.stdout }}"
+          - name: Generating lakefs_secret_access_key
+            shell: openssl rand -hex 24
+            register: lakefs_secret_access_key
+
+          - name: Storing lakefs_secret_access_key
+            copy:
+              dest: "/root/.lakefs_secret_access_key"
+              content: |
+                lakefs_secret_access_key = "{{ lakefs_secret_access_key.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install required packages
+            apt:
+              name:
+                - curl
+                - tar
+              state: latest
+              lock_timeout: 300
+
+          - name: Create dedicated non-root lakefs system user
+            user:
+              name: lakefs
+              system: yes
+              shell: /usr/sbin/nologin
+              create_home: no
+              home: /var/lib/lakefs
+
+          - name: Ensure /opt/lakefs exists
+            file:
+              path: /opt/lakefs
+              state: directory
+              owner: lakefs
+              group: lakefs
+              mode: '0755'
+
+          - name: Download pinned lakeFS release tarball
+            get_url:
+              url: https://github.com/treeverse/lakeFS/releases/download/v1.83.0/lakeFS_1.83.0_Linux_x86_64.tar.gz
+              dest: /tmp/lakeFS_1.83.0_Linux_x86_64.tar.gz
+              mode: '0644'
+
+          - name: Check if lakeFS binary already extracted
+            stat:
+              path: /opt/lakefs/lakefs
+            register: lakefs_bin
+
+          - name: Extract lakeFS binaries to /opt/lakefs
+            unarchive:
+              src: /tmp/lakeFS_1.83.0_Linux_x86_64.tar.gz
+              dest: /opt/lakefs
+              remote_src: yes
+              owner: lakefs
+              group: lakefs
+              mode: '0755'
+            when: not lakefs_bin.stat.exists
+
+          - name: Create lakeFS data directories (must exist and be lakefs-owned before start)
+            file:
+              path: "{{ item }}"
+              state: directory
+              owner: lakefs
+              group: lakefs
+              mode: '0755'
+            loop:
+              - /var/lib/lakefs
+              - /var/lib/lakefs/metadata
+              - /var/lib/lakefs/data
+              - /var/lib/lakefs/cache
+
+          - name: Write lakeFS server config (single-VM local KV + local blockstore)
+            copy:
+              dest: /opt/lakefs/config.yaml
+              owner: lakefs
+              group: lakefs
+              mode: '0640'
+              content: |
+                listen_address: "0.0.0.0:8000"
+                logging:
+                  level: "INFO"
+                database:
+                  type: "local"
+                  local:
+                    path: "/var/lib/lakefs/metadata"
+                blockstore:
+                  type: "local"
+                  local:
+                    path: "/var/lib/lakefs/data"
+                committed:
+                  local_cache:
+                    dir: "/var/lib/lakefs/cache"
+                auth:
+                  encrypt:
+                    secret_key: "{{ lakefs_encrypt_key.stdout }}"
+
+          - name: Deploy lakefs systemd unit
+            copy:
+              dest: /etc/systemd/system/lakefs.service
+              mode: '0644'
+              content: |
+                [Unit]
+                Description=lakeFS Server
+                After=network.target
+
+                [Service]
+                User=lakefs
+                Group=lakefs
+                ExecStart=/opt/lakefs/lakefs run --config /opt/lakefs/config.yaml
+                Restart=on-failure
+                RestartSec=5
+
+                [Install]
+                WantedBy=multi-user.target
+
+          - name: Check if lakeFS is already initialized
+            find:
+              paths: /var/lib/lakefs/metadata
+            register: lakefs_meta
+
+          - name: Create lakeFS admin credentials (headless, before first service start)
+            command: >
+              /opt/lakefs/lakefs setup
+              --config /opt/lakefs/config.yaml
+              --user-name admin
+              --access-key-id AKIAMARKGENLAKEFS01
+              --secret-access-key {{ lakefs_secret_access_key.stdout }}
+            become: true
+            become_user: lakefs
+            register: lakefs_setup
+            when: lakefs_meta.matched == 0
+            failed_when: lakefs_setup.rc != 0 and 'already initialized' not in (lakefs_setup.stderr | default(''))
+
+          - name: Ensure lakeFS data dirs remain lakefs-owned after setup
+            file:
+              path: "{{ item }}"
+              state: directory
+              owner: lakefs
+              group: lakefs
+              recurse: yes
+            loop:
+              - /opt/lakefs
+              - /var/lib/lakefs
+
+          - name: Enable and start lakefs service
+            systemd:
+              name: lakefs
+              state: started
+              enabled: yes
+              daemon_reload: yes
+
+          - name: Write credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                lakeFS Access Details
+                Web UI:           http://<server-ip>:8000/
+                S3-compatible API port: 8000
+
+                NOTE: lakeFS login uses an S3-style credential PAIR (Access Key ID + Secret
+                Access Key), NOT a username/password.
+
+                Access Key ID:     AKIAMARKGENLAKEFS01
+                Secret Access Key: {{ lakefs_secret_access_key.stdout }}
+
+                This deployment is a SINGLE-VM setup using an embedded local KV store and
+                local blockstore under /var/lib/lakefs. For production, upgrade to a
+                PostgreSQL database + S3 (or compatible) object storage backend.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/lakefs-24-04/opt/cloudstack/lakefs-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/lakefs-24-04/opt/cloudstack/lakefs-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/lakefs-24-04_cleanup.sh && /opt/cloudstack/lakefs-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
