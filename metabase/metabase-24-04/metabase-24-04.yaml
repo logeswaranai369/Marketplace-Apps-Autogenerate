@@ -1,0 +1,182 @@
+- name: Metabase Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Metabase
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # Block until the lock clears (and use lock_timeout on apt tasks) before installing.
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating metabase_admin_password
+            shell: openssl rand -hex 24
+            register: metabase_admin_password
+
+          - name: Storing metabase_admin_password
+            copy:
+              dest: "/root/.metabase_admin_password"
+              content: |
+                metabase_admin_password = "{{ metabase_admin_password.stdout }}"
+
+          - name: Copy staged config files
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/metabase-24-04/etc/systemd/system/metabase.service', confdest: '/etc/systemd/system/'}
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Metabase - install Java 21 runtime and curl
+            apt:
+              name:
+                - openjdk-21-jre-headless
+                - curl
+              state: latest
+              lock_timeout: 300
+
+          - name: Metabase - verify Java 21 is available
+            command: java -version
+            register: java_ver
+            changed_when: false
+
+          - name: Metabase - show detected Java version
+            debug:
+              msg: "{{ java_ver.stderr_lines | default(java_ver.stdout_lines) }}"
+
+          - name: Metabase - create dedicated system user (never run the JAR as root)
+            user:
+              name: metabase
+              system: yes
+              create_home: yes
+              home: /opt/metabase
+              shell: /usr/sbin/nologin
+              state: present
+
+          - name: Metabase - ensure install directory exists
+            file:
+              path: /opt/metabase
+              state: directory
+              owner: metabase
+              group: metabase
+              mode: '0755'
+
+          - name: Metabase - download version-pinned JAR (idempotent)
+            get_url:
+              url: https://downloads.metabase.com/v0.62.4/metabase.jar
+              dest: /opt/metabase/metabase.jar
+              owner: metabase
+              group: metabase
+              mode: '0644'
+
+          - name: Metabase - ensure install tree is owned by the metabase user
+            file:
+              path: /opt/metabase
+              state: directory
+              owner: metabase
+              group: metabase
+              recurse: yes
+
+          - name: Metabase - reload systemd and enable/start the service
+            systemd:
+              name: metabase
+              daemon_reload: yes
+              enabled: yes
+              state: started
+
+          - name: Metabase - wait for Jetty to bind on TCP 3000 (H2 migrations run on first boot)
+            wait_for:
+              host: 127.0.0.1
+              port: 3000
+              delay: 5
+              timeout: 300
+
+          - name: Metabase - poll health endpoint until migrations finish (first probe is 503)
+            uri:
+              url: http://localhost:3000/api/health
+              return_content: yes
+            register: mb_health
+            until: mb_health.status == 200
+            retries: 40
+            delay: 15
+
+          - name: Metabase - show health status
+            debug:
+              msg: "Metabase health endpoint returned {{ mb_health.status }}"
+
+          - name: Metabase - read setup properties (setup-token / has-user-setup)
+            uri:
+              url: http://localhost:3000/api/session/properties
+              return_content: yes
+            register: mb_props
+
+          - name: Metabase - create the initial admin (non-interactive, consumes setup-token)
+            uri:
+              url: http://localhost:3000/api/setup
+              method: POST
+              body_format: json
+              body:
+                token: "{{ mb_props.json['setup-token'] }}"
+                user:
+                  first_name: Site
+                  last_name: Admin
+                  email: admin@example.com
+                  password: "{{ metabase_admin_password.stdout }}A!"
+                prefs:
+                  site_name: Metabase
+                  allow_tracking: false
+              status_code: [200, 201]
+            register: mb_setup
+            when: not (mb_props.json['has-user-setup'] | default(false))
+
+          - name: Metabase - write operator credentials file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              mode: '0600'
+              content: |
+                Metabase
+                URL:            http://<server-ip>:3000/
+                Login email:    admin@example.com
+                Admin password: {{ metabase_admin_password.stdout }}A!
+
+                Note: login is by EMAIL (admin@example.com), not a username.
+                The embedded H2 database lives at /opt/metabase/ — for production
+                it is recommended to migrate to PostgreSQL.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/metabase-24-04/opt/cloudstack/metabase-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/metabase-24-04/opt/cloudstack/metabase-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/metabase-24-04_cleanup.sh && /opt/cloudstack/metabase-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"

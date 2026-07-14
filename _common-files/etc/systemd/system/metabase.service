@@ -1,0 +1,19 @@
+[Unit]
+Description=Metabase
+After=network.target
+
+[Service]
+Type=simple
+User=metabase
+Group=metabase
+WorkingDirectory=/opt/metabase
+ExecStart=/usr/bin/java -jar /opt/metabase/metabase.jar
+Environment=MB_JETTY_HOST=0.0.0.0
+Environment=MB_JETTY_PORT=3000
+Environment=MB_DB_FILE=/opt/metabase/metabase.db
+Restart=on-failure
+SuccessExitStatus=143
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
