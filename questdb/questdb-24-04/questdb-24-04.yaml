@@ -1,0 +1,221 @@
+- name: QuestDB Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure QuestDB
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # STOP the apt-daily timers/services FIRST so they cannot re-acquire the lock mid-run — a
+          # one-shot wait isn't enough for long installs (GitLab/BBB/desktop, ~20-40 min): the timer
+          # fires again during the install and kills a later apt task with rc=100 (hit live on Ubuntu
+          # Desktop). Then block until any in-progress lock clears before installing.
+          - name: Stop apt-daily timers/services so they can't grab the dpkg lock mid-install
+            shell: |
+              systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+              systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+              systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+              exit 0
+            changed_when: false
+
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating questdb_admin_password
+            shell: openssl rand -hex 24
+            register: questdb_admin_password
+
+          - name: Storing questdb_admin_password
+            copy:
+              dest: "/root/.questdb_password"
+              content: |
+                questdb_admin_password = "{{ questdb_admin_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install required packages
+            apt:
+              name:
+                - curl
+                - tar
+              state: latest
+              lock_timeout: 300
+
+          - name: Create QuestDB install directory
+            file:
+              path: /opt/questdb
+              state: directory
+              mode: '0755'
+
+          - name: Download QuestDB bundled-JRE release tarball (pinned 9.4.3)
+            get_url:
+              url: https://github.com/questdb/questdb/releases/download/9.4.3/questdb-9.4.3-rt-linux-x86-64.tar.gz
+              dest: /tmp/questdb-9.4.3-rt-linux-x86-64.tar.gz
+              mode: '0644'
+
+          - name: Check if QuestDB is already extracted
+            stat:
+              path: /opt/questdb/bin/questdb.sh
+            register: questdb_extracted
+
+          - name: Extract QuestDB into /opt/questdb
+            unarchive:
+              src: /tmp/questdb-9.4.3-rt-linux-x86-64.tar.gz
+              dest: /opt/questdb
+              remote_src: yes
+              extra_opts:
+                - --strip-components=1
+            when: not questdb_extracted.stat.exists
+
+          - name: Create dedicated questdb system user
+            user:
+              name: questdb
+              system: yes
+              create_home: no
+              home: /var/lib/questdb
+              shell: /usr/sbin/nologin
+              state: present
+
+          - name: Create QuestDB data and conf directories
+            file:
+              path: /var/lib/questdb/conf
+              state: directory
+              owner: questdb
+              group: questdb
+              mode: '0755'
+
+          - name: Debug - securing QuestDB before first start (Basic auth on REST + PG wire)
+            debug:
+              msg: "Seeding /var/lib/questdb/conf/server.conf with admin credentials before first exposure"
+
+          # QuestDB open-source is UNAUTHENTICATED by default. Seed server.conf with the generated
+          # password BEFORE first start so :9000 (REST/console) and :8812 (PG wire) require auth.
+          # This file holds a secret, so it is written inline with the real value (never a placeholder).
+          - name: Write QuestDB server.conf with admin credentials
+            copy:
+              dest: /var/lib/questdb/conf/server.conf
+              owner: questdb
+              group: questdb
+              mode: '0640'
+              content: |
+                http.user=admin
+                http.password={{ questdb_admin_password.stdout }}
+                pg.user=admin
+                pg.password={{ questdb_admin_password.stdout }}
+
+          - name: Ensure ownership of QuestDB install and data dirs
+            file:
+              path: "{{ item }}"
+              state: directory
+              owner: questdb
+              group: questdb
+              recurse: yes
+            loop:
+              - /opt/questdb
+              - /var/lib/questdb
+
+          - name: Debug - installing QuestDB systemd unit
+            debug:
+              msg: "Writing questdb.service (Type=simple, foreground launcher) and starting the service"
+
+          - name: Install QuestDB systemd unit
+            copy:
+              dest: /etc/systemd/system/questdb.service
+              mode: '0644'
+              content: |
+                [Unit]
+                Description=QuestDB
+                After=network.target
+
+                [Service]
+                Type=simple
+                User=questdb
+                Group=questdb
+                ExecStart=/opt/questdb/bin/questdb.sh start -d /var/lib/questdb -n -f
+                ExecStop=/opt/questdb/bin/questdb.sh stop -d /var/lib/questdb
+                Restart=on-failure
+                RestartSec=5
+                LimitNOFILE=1048576
+
+                [Install]
+                WantedBy=multi-user.target
+
+          - name: Reload systemd, enable and start QuestDB
+            systemd:
+              name: questdb
+              daemon_reload: yes
+              enabled: yes
+              state: started
+
+          - name: Wait for QuestDB REST/console port 9000 to open
+            wait_for:
+              host: 127.0.0.1
+              port: 9000
+              delay: 3
+              timeout: 90
+
+          - name: Verify QuestDB health endpoint responds (authenticated)
+            uri:
+              url: http://localhost:9003/
+              user: admin
+              password: "{{ questdb_admin_password.stdout }}"
+              force_basic_auth: yes
+              status_code: 200
+            register: qdb_health
+            retries: 10
+            delay: 5
+            until: qdb_health.status == 200
+            failed_when: false
+
+          - name: Write credentials file for operator
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+              content: |
+                QuestDB access details
+                Web console : http://<server-ip>:9000  (login: admin / {{ questdb_admin_password.stdout }})
+                PostgreSQL wire : host <server-ip> port 8812 user admin password {{ questdb_admin_password.stdout }} db qdb
+                InfluxDB line protocol ingest : <server-ip>:9009
+                Health / metrics : http://<server-ip>:9003/ (basic-auth admin / password)
+                Data directory : /var/lib/questdb
+
+                Remember to open port 9000 (and 8812 / 9009 as needed) in the firewall.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/questdb-24-04/opt/cloudstack/questdb-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/questdb-24-04/opt/cloudstack/questdb-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/questdb-24-04_cleanup.sh && /opt/cloudstack/questdb-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
