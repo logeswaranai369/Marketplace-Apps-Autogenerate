@@ -1,0 +1,194 @@
+- name: CloudPanel Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure CloudPanel
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # STOP the apt-daily timers/services FIRST so they cannot re-acquire the lock mid-run — a
+          # one-shot wait isn't enough for long installs (GitLab/BBB/desktop, ~20-40 min): the timer
+          # fires again during the install and kills a later apt task with rc=100 (hit live on Ubuntu
+          # Desktop). Then block until any in-progress lock clears before installing.
+          - name: Stop apt-daily timers/services so they can't grab the dpkg lock mid-install
+            shell: |
+              systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+              systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+              systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+              exit 0
+            changed_when: false
+
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating cloudpanel_admin_password
+            shell: openssl rand -hex 24
+            register: cloudpanel_admin_password
+
+          - name: Storing cloudpanel_admin_password
+            copy:
+              dest: "/root/.cloudpanel_password"
+              content: |
+                cloudpanel_admin_password = "{{ cloudpanel_admin_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages
+            apt:
+              name:
+                - curl
+              state: latest
+              lock_timeout: 300
+
+          - name: Stop apt daily timers so they do not fight the CloudPanel installer
+            shell: |
+              systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+              systemctl stop unattended-upgrades 2>/dev/null || true
+              systemctl kill --kill-who=all apt-daily.service 2>/dev/null || true
+            changed_when: false
+
+          - name: Check if CloudPanel is already installed
+            stat:
+              path: /usr/bin/clpctl
+            register: clpctl_bin
+
+          - name: Download CloudPanel installer
+            get_url:
+              url: https://installer.cloudpanel.io/ce/v2/install.sh
+              dest: /tmp/install.sh
+              mode: '0755'
+            when: not clpctl_bin.stat.exists
+
+          - name: Notify start of CloudPanel installation (this takes ~10 minutes)
+            debug:
+              msg: "Running CloudPanel installer with MYSQL_8.4 as real root — this can take ~10 minutes."
+            when: not clpctl_bin.stat.exists
+
+          # Run the installer in a CLEAN root login shell (su - root) so SUDO_* env vars from the
+          # become/sudo context are dropped — some vendor installers abort if SUDO_* is present even
+          # when already UID 0 (rule 37). Async + poll because it runs ~10 min of apt work (rule 37a).
+          - name: Run CloudPanel installer (async)
+            command: >
+              su - root -c "DB_ENGINE=MYSQL_8.4 bash /tmp/install.sh"
+            args:
+              creates: /usr/bin/clpctl
+            async: 1200
+            poll: 0
+            register: clp_install
+            when: not clpctl_bin.stat.exists
+
+          - name: Wait for CloudPanel installation to finish
+            async_status:
+              jid: "{{ clp_install.ansible_job_id }}"
+            register: clp_job
+            until: clp_job.finished
+            retries: 60
+            delay: 30
+            when: not clpctl_bin.stat.exists
+
+          - name: Fail if the CloudPanel installer exited non-zero
+            fail:
+              msg: "CloudPanel installer failed (rc={{ clp_job.rc }})."
+            when:
+              - not clpctl_bin.stat.exists
+              - clp_job.rc is defined
+              - clp_job.rc != 0
+
+          - name: Ensure nginx is enabled and running
+            service:
+              name: nginx
+              state: started
+              enabled: yes
+
+          - name: Check whether the admin user already exists
+            shell: clpctl user:list 2>/dev/null | grep -qw admin
+            register: clp_admin_exists
+            failed_when: false
+            changed_when: false
+
+          - name: Create CloudPanel admin user headlessly
+            command: >
+              clpctl user:add
+              --userName='admin'
+              --email='admin@example.com'
+              --firstName='Cloud'
+              --lastName='Admin'
+              --password='{{ cloudpanel_admin_password.stdout }}'
+              --role='admin'
+              --timezone='UTC'
+              --status='1'
+            register: clp_useradd
+            failed_when: false
+            when: clp_admin_exists.rc != 0
+
+          - name: Determine credentials file owner (ubuntu if present, else root)
+            shell: id -u ubuntu >/dev/null 2>&1 && echo ubuntu || echo root
+            register: cred_owner
+            changed_when: false
+
+          - name: Set credentials home directory fact
+            set_fact:
+              cred_home: "{{ '/home/ubuntu' if cred_owner.stdout == 'ubuntu' else '/root' }}"
+
+          - name: Write CloudPanel credentials file
+            copy:
+              dest: "{{ cred_home }}/credentials.txt"
+              owner: "{{ cred_owner.stdout }}"
+              group: "{{ cred_owner.stdout }}"
+              mode: '0600'
+              content: |
+                CloudPanel Admin Panel
+                URL       : https://<server-ip>:8443  (accept the self-signed certificate)
+                Username  : admin
+                Password  : {{ cloudpanel_admin_password.stdout }}
+
+                Open 8443/tcp for the panel, and 80/443 for hosted websites.
+
+          - name: Verify the CloudPanel admin UI responds on 8443 (self-signed)
+            uri:
+              url: https://localhost:8443/login
+              method: GET
+              validate_certs: no
+              status_code: 200
+            register: clp_login
+            until: clp_login.status == 200
+            retries: 20
+            delay: 15
+            failed_when: false
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/cloudpanel-24-04/opt/cloudstack/cloudpanel-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/cloudpanel-24-04/opt/cloudstack/cloudpanel-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/cloudpanel-24-04_cleanup.sh && /opt/cloudstack/cloudpanel-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
