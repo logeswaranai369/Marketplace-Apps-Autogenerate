@@ -1,0 +1,202 @@
+- name: Ubuntu Desktop 24 Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Ubuntu Desktop 24
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # STOP the apt-daily timers/services FIRST so they cannot re-acquire the lock mid-run — a
+          # one-shot wait isn't enough for long installs (GitLab/BBB/desktop, ~20-40 min): the timer
+          # fires again during the install and kills a later apt task with rc=100 (hit live on Ubuntu
+          # Desktop). Then block until any in-progress lock clears before installing.
+          - name: Stop apt-daily timers/services so they can't grab the dpkg lock mid-install
+            shell: |
+              systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+              systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+              systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+              exit 0
+            changed_when: false
+
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating desktop_password
+            shell: openssl rand -hex 24
+            register: desktop_password
+
+          - name: Storing desktop_password
+            copy:
+              dest: "/root/.desktop_password"
+              content: |
+                desktop_password = "{{ desktop_password.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: "STEP 1 - Detect primary network interface (do NOT hardcode ens3)"
+            shell: ip -o -4 route show to default | awk '{print $5}' | head -1
+            register: primary_iface
+            changed_when: false
+
+          - name: "STEP 1 - Create NetworkManager conf.d directory FIRST (NM not installed yet)"
+            file:
+              path: /etc/NetworkManager/conf.d
+              state: directory
+              mode: '0755'
+
+          - name: "STEP 1 - Tell NetworkManager NOT to manage the primary NIC (prevents SSH lockout)"
+            copy:
+              dest: /etc/NetworkManager/conf.d/10-unmanage-primary.conf
+              mode: '0644'
+              content: |
+                [keyfile]
+                unmanaged-devices=interface-name:{{ primary_iface.stdout }}
+
+          - name: "STEP 1 - Pin netplan renderer to systemd-networkd"
+            copy:
+              dest: /etc/netplan/99-renderer-networkd.yaml
+              mode: '0600'
+              content: |
+                network:
+                  version: 2
+                  renderer: networkd
+
+          - name: "STEP 1 - Regenerate netplan config (generate NOT apply, so the link is not bounced)"
+            command: netplan generate
+            changed_when: false
+
+          - name: "STEP 2 - Update apt cache (wait out boot apt/dpkg lock)"
+            apt:
+              update_cache: yes
+              lock_timeout: 300
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+
+          - name: "STEP 2 - Install Ubuntu Desktop minimal, xrdp and dbus-x11 (LONG ~20-40 min, async)"
+            apt:
+              name:
+                - ubuntu-desktop-minimal
+                - xrdp
+                - dbus-x11
+              state: latest
+              lock_timeout: 300
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+            async: 3600
+            poll: 60
+
+          - name: "STEP 2 - Set graphical.target as the default boot target"
+            command: systemctl set-default graphical.target
+            changed_when: false
+
+          - name: "STEP 3 - Check if the dedicated desktop user already exists (idempotency guard)"
+            command: id desktop
+            register: desktop_user_check
+            failed_when: false
+            changed_when: false
+
+          - name: "STEP 3 - Create dedicated desktop user (never touch the cloud ubuntu user)"
+            user:
+              name: desktop
+              shell: /bin/bash
+              groups: sudo,users
+              append: yes
+              create_home: yes
+            when: desktop_user_check.rc != 0
+
+          - name: "STEP 3 - Set the desktop user password from the generated secret"
+            shell: echo 'desktop:{{ desktop_password.stdout }}' | chpasswd
+            no_log: true
+
+          - name: "STEP 4 - Add xrdp user to ssl-cert group so it can read the TLS key"
+            user:
+              name: xrdp
+              groups: ssl-cert
+              append: yes
+
+          - name: "STEP 4 - Suppress GNOME colord polkit popups that block the RDP session"
+            copy:
+              dest: /etc/polkit-1/rules.d/49-allow-colord.rules
+              mode: '0644'
+              content: |
+                polkit.addRule(function(action, subject) {
+                    if (action.id.indexOf("org.freedesktop.color-manager.") == 0 && subject.isInGroup("users")) {
+                        return polkit.Result.YES;
+                    }
+                });
+
+          - name: "STEP 4 - Enable xrdp service"
+            service:
+              name: xrdp
+              enabled: yes
+
+          - name: "STEP 4 - Restart polkit to pick up the colord rule"
+            service:
+              name: polkit
+              state: restarted
+
+          - name: "STEP 4 - Restart xrdp"
+            service:
+              name: xrdp
+              state: restarted
+
+          - name: "STEP 4 - Enable and start the GNOME Display Manager"
+            service:
+              name: gdm3
+              enabled: yes
+              state: started
+
+          - name: "Write RDP connection credentials for the operator"
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+              content: |
+                Ubuntu Desktop 24.04 over RDP
+                Connect with any RDP client to:  <server-ip>:3389
+                RDP username: desktop
+                RDP password: {{ desktop_password.stdout }}
+
+                NOTE: You must open 3389/tcp in the CloudStack security group / firewall
+                      for the RDP connection to reach this VM.
+
+                The existing `ubuntu` user and its portal-provided password remain valid
+                and unchanged for SSH on port 22.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/ubuntu-desktop-24-04/opt/cloudstack/ubuntu-desktop-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/ubuntu-desktop-24-04/opt/cloudstack/ubuntu-desktop-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/ubuntu-desktop-24-04_cleanup.sh && /opt/cloudstack/ubuntu-desktop-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
