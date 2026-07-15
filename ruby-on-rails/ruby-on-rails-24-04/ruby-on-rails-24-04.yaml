@@ -1,0 +1,294 @@
+- name: Ruby on Rails Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure Ruby on Rails
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # STOP the apt-daily timers/services FIRST so they cannot re-acquire the lock mid-run — a
+          # one-shot wait isn't enough for long installs (GitLab/BBB/desktop, ~20-40 min): the timer
+          # fires again during the install and kills a later apt task with rc=100 (hit live on Ubuntu
+          # Desktop). Then block until any in-progress lock clears before installing.
+          - name: Stop apt-daily timers/services so they can't grab the dpkg lock mid-install
+            shell: |
+              systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+              systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+              systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+              exit 0
+            changed_when: false
+
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+          - name: Generating railsapp_secret_key_base
+            shell: openssl rand -hex 24
+            register: railsapp_secret_key_base
+
+          - name: Storing railsapp_secret_key_base
+            copy:
+              dest: "/root/.railsapp_secret"
+              content: |
+                railsapp_secret_key_base = "{{ railsapp_secret_key_base.stdout }}"
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install Ruby, build tools, and web server packages
+            apt:
+              name:
+                - ruby-full
+                - ruby-dev
+                - build-essential
+                - libyaml-dev
+                - libsqlite3-dev
+                - sqlite3
+                - pkg-config
+                - zlib1g-dev
+                - nginx
+                - git
+              state: latest
+              lock_timeout: 300
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+
+          - name: Install Rails gem (system-wide)
+            command: gem install rails --no-document
+            args:
+              creates: /usr/local/bin/rails
+
+          # Ubuntu ships bundler as a DEFAULT gem (no /usr/local/bin/bundle executable), so guarding on
+          # `gem list -i bundler` would skip this and the next `bundle` call would fail. Guard on the
+          # BINSTUB instead so we truly get a usable /usr/local/bin/bundle.
+          - name: Install bundler and its binstub
+            command: gem install bundler --no-document
+            args:
+              creates: /usr/local/bin/bundle
+
+          - name: Create non-root service user 'railsapp'
+            user:
+              name: railsapp
+              home: /home/railsapp
+              shell: /bin/bash
+              create_home: yes
+
+          - name: Scaffold the sample Rails app (as railsapp)
+            debug:
+              msg: "Generating sample Rails application in /home/railsapp/myapp"
+
+          - name: Run rails new (SQLite default, no DB server needed)
+            command: rails new myapp --skip-git
+            args:
+              chdir: /home/railsapp
+              creates: /home/railsapp/myapp/Gemfile
+            become: true
+            become_user: railsapp
+            environment:
+              HOME: /home/railsapp
+
+          - name: Configure bundler to use an app-local, user-writable gem path
+            command: bundle config set --local path vendor/bundle
+            args:
+              chdir: /home/railsapp/myapp
+            become: true
+            become_user: railsapp
+            environment:
+              HOME: /home/railsapp
+
+          - name: Install application gems into vendor/bundle (as railsapp)
+            command: bundle install
+            args:
+              chdir: /home/railsapp/myapp
+              creates: /home/railsapp/myapp/vendor/bundle
+            become: true
+            become_user: railsapp
+            environment:
+              HOME: /home/railsapp
+
+          - name: Add a real root route so the app serves 200 (not a blank/error page)
+            debug:
+              msg: "Creating WelcomeController and root route"
+
+          - name: Create welcome controller
+            copy:
+              dest: /home/railsapp/myapp/app/controllers/welcome_controller.rb
+              content: |
+                class WelcomeController < ApplicationController
+                  def index
+                    render html: "Hello from Ruby on Rails".html_safe
+                  end
+                end
+              owner: railsapp
+              group: railsapp
+              mode: '0644'
+
+          - name: Add root route to config/routes.rb
+            lineinfile:
+              path: /home/railsapp/myapp/config/routes.rb
+              line: '  root "welcome#index"'
+              insertafter: 'Rails.application.routes.draw do'
+              state: present
+
+          # Persist the pre-generated SECRET_KEY_BASE (do NOT regenerate on each boot — that breaks
+          # sessions). The secret was generated by the scaffold and registered in-play.
+          - name: Write production environment file with persisted secret
+            copy:
+              dest: /home/railsapp/myapp/.env.production
+              content: |
+                RAILS_ENV=production
+                SECRET_KEY_BASE={{ railsapp_secret_key_base.stdout }}
+              owner: railsapp
+              group: railsapp
+              mode: '0600'
+
+          - name: Prepare the production database (SQLite)
+            command: bundle exec rails db:prepare
+            args:
+              chdir: /home/railsapp/myapp
+            become: true
+            become_user: railsapp
+            environment:
+              HOME: /home/railsapp
+              RAILS_ENV: production
+              SECRET_KEY_BASE: "{{ railsapp_secret_key_base.stdout }}"
+
+          - name: Precompile production assets
+            command: bundle exec rails assets:precompile
+            args:
+              chdir: /home/railsapp/myapp
+            become: true
+            become_user: railsapp
+            environment:
+              HOME: /home/railsapp
+              RAILS_ENV: production
+              SECRET_KEY_BASE: "{{ railsapp_secret_key_base.stdout }}"
+
+          - name: Deploy systemd unit for the Rails app (Puma)
+            debug:
+              msg: "Installing railsapp systemd service (Puma on 127.0.0.1:3000)"
+
+          - name: Write railsapp systemd unit
+            copy:
+              dest: /etc/systemd/system/railsapp.service
+              content: |
+                [Unit]
+                Description=Ruby on Rails sample app (Puma)
+                After=network.target
+
+                [Service]
+                Type=simple
+                User=railsapp
+                Group=railsapp
+                WorkingDirectory=/home/railsapp/myapp
+                EnvironmentFile=/home/railsapp/myapp/.env.production
+                ExecStart=/usr/local/bin/bundle exec rails server -e production -b 127.0.0.1 -p 3000
+                Restart=on-failure
+                RestartSec=5
+
+                [Install]
+                WantedBy=multi-user.target
+              mode: '0644'
+
+          - name: Reload systemd, enable and start railsapp
+            systemd:
+              name: railsapp
+              daemon_reload: yes
+              enabled: yes
+              state: started
+
+          - name: Configure nginx reverse proxy
+            debug:
+              msg: "Setting up nginx to serve the Rails app on port 80"
+
+          - name: Deploy nginx vhost for the Rails app
+            copy:
+              dest: /etc/nginx/sites-available/railsapp.conf
+              content: |
+                server {
+                    listen 80 default_server;
+                    listen [::]:80 default_server;
+                    server_name _;
+
+                    location / {
+                        proxy_pass http://127.0.0.1:3000;
+                        proxy_http_version 1.1;
+                        proxy_set_header Upgrade $http_upgrade;
+                        proxy_set_header Connection keep-alive;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+                }
+              mode: '0644'
+
+          - name: Enable the railsapp nginx site
+            file:
+              src: /etc/nginx/sites-available/railsapp.conf
+              dest: /etc/nginx/sites-enabled/railsapp.conf
+              state: link
+
+          - name: Remove default nginx site
+            file:
+              path: /etc/nginx/sites-enabled/default
+              state: absent
+
+          - name: Validate nginx configuration
+            command: nginx -t
+            changed_when: false
+
+          - name: Enable and restart nginx
+            service:
+              name: nginx
+              state: restarted
+              enabled: yes
+
+          - name: Write operator credentials/record file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              content: |
+                Ruby on Rails sample app
+                Site:        http://<server-ip>/   (port 80/tcp open)
+                App service: railsapp  (Puma on 127.0.0.1:3000, behind nginx)
+                App path:    /home/railsapp/myapp
+                Gems:        /home/railsapp/myapp/vendor/bundle
+                SECRET_KEY_BASE persisted in /home/railsapp/myapp/.env.production
+                Deploy your own code, then: systemctl restart railsapp
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/ruby-on-rails-24-04/opt/cloudstack/ruby-on-rails-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/ruby-on-rails-24-04/opt/cloudstack/ruby-on-rails-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/ruby-on-rails-24-04_cleanup.sh && /opt/cloudstack/ruby-on-rails-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
