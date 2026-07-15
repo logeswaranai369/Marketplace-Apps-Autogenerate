@@ -1,0 +1,112 @@
+- name: MLDev Basic Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure MLDev Basic
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # STOP the apt-daily timers/services FIRST so they cannot re-acquire the lock mid-run — a
+          # one-shot wait isn't enough for long installs (GitLab/BBB/desktop, ~20-40 min): the timer
+          # fires again during the install and kills a later apt task with rc=100 (hit live on Ubuntu
+          # Desktop). Then block until any in-progress lock clears before installing.
+          - name: Stop apt-daily timers/services so they can't grab the dpkg lock mid-install
+            shell: |
+              systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+              systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+              systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+              exit 0
+            changed_when: false
+
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install prerequisite packages (venv, pip, git, curl)
+            apt:
+              name:
+                - python3-venv
+                - python3-pip
+                - python3-full
+                - git
+                - curl
+              state: latest
+              lock_timeout: 300
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+
+          - name: Create dedicated MLDev virtualenv
+            command: python3 -m venv /opt/mldev-venv
+            args:
+              creates: /opt/mldev-venv/bin/python
+
+          - name: Upgrade pip and wheel inside the venv
+            command: /opt/mldev-venv/bin/pip install --upgrade pip wheel
+
+          - name: Install MLDev Basic (base extra)
+            command: /opt/mldev-venv/bin/pip install "mldev[base]"
+
+          # CRITICAL PIN: mldev imports pkg_resources, which setuptools>=81 REMOVED. A fresh venv
+          # upgrades setuptools to ~83, so `mldev version` crashes with
+          # "ModuleNotFoundError: No module named 'pkg_resources'". Pinning setuptools<81 restores it.
+          - name: Pin setuptools<81 so pkg_resources exists (CLI is dead without this)
+            command: /opt/mldev-venv/bin/pip install "setuptools<81"
+
+          - name: Symlink mldev onto PATH for all users
+            file:
+              src: /opt/mldev-venv/bin/mldev
+              dest: /usr/local/bin/mldev
+              state: link
+              force: yes
+
+          - name: "Verify the mldev CLI runs and prints its version"
+            command: /opt/mldev-venv/bin/mldev version
+            register: mldev_version
+            changed_when: false
+            # `version` is a SUBCOMMAND (not --version). mldev prints an INFO banner and a
+            # pkg_resources UserWarning to STDERR before the version line — match the version on
+            # STDOUT and do NOT fail on stderr noise.
+            failed_when: mldev_version.rc != 0 or ('0.5' not in mldev_version.stdout)
+
+          - name: Show the detected MLDev version
+            debug:
+              msg: "MLDev Basic installed. CLI output: {{ mldev_version.stdout }}"
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/mldev-basic-24-04/opt/cloudstack/mldev-basic-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/mldev-basic-24-04/opt/cloudstack/mldev-basic-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/mldev-basic-24-04_cleanup.sh && /opt/cloudstack/mldev-basic-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
