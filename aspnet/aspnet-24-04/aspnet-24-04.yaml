@@ -1,0 +1,231 @@
+- name: ASP.NET Setup
+  hosts: localhost
+  tasks:
+      - name: Restarting sshd
+        shell: "sed -i 's/#Match User anoncvs/ForceCommand echo Please wait until the installation is completed..../g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
+
+      - name: Install and configure ASP.NET
+        block:
+          # On a freshly-booted Ubuntu the apt/dpkg lock is held by cloud-init's boot-time
+          # `unattended-upgrades`/apt.systemd.daily. The first package task races it and fails with
+          # "Could not get lock /var/lib/dpkg/lock-frontend ... held by process N (unattended-upgr)".
+          # STOP the apt-daily timers/services FIRST so they cannot re-acquire the lock mid-run — a
+          # one-shot wait isn't enough for long installs (GitLab/BBB/desktop, ~20-40 min): the timer
+          # fires again during the install and kills a later apt task with rc=100 (hit live on Ubuntu
+          # Desktop). Then block until any in-progress lock clears before installing.
+          - name: Stop apt-daily timers/services so they can't grab the dpkg lock mid-install
+            shell: |
+              systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+              systemctl stop apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+              systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+              exit 0
+            changed_when: false
+
+          - name: Await release of the apt/dpkg lock (boot-time unattended-upgrades)
+            shell: |
+              for i in $(seq 1 60); do
+                fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || exit 0
+                sleep 10
+              done
+              exit 0
+            changed_when: false
+
+          - name: Updating Packages
+            ansible.builtin.apt:
+              update_cache: yes
+              lock_timeout: 300
+
+
+
+          # ----- BEGIN app-specific tasks (LLM-generated from AppSpec) -----
+          - name: Install .NET SDK and ASP.NET Core runtime from the Ubuntu archive feed
+            apt:
+              name:
+                - dotnet-sdk-10.0
+                - aspnetcore-runtime-10.0
+              state: latest
+              lock_timeout: 300
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+
+          - name: Install nginx reverse proxy
+            apt:
+              name: nginx
+              state: latest
+              lock_timeout: 300
+            environment:
+              DEBIAN_FRONTEND: noninteractive
+
+          - name: Create non-root service user for the ASP.NET app
+            user:
+              name: aspnetapp
+              home: /home/aspnetapp
+              shell: /bin/bash
+              create_home: yes
+              state: present
+
+          - name: Ensure source and app directories exist (owned by aspnetapp)
+            file:
+              path: "{{ item }}"
+              state: directory
+              owner: aspnetapp
+              group: aspnetapp
+              mode: '0755'
+            loop:
+              - /home/aspnetapp/src
+              - /home/aspnetapp/app
+
+          - name: Show scaffold stage
+            debug:
+              msg: "Scaffolding the sample ASP.NET Core 'HelloApp' as the aspnetapp user"
+
+          - name: Scaffold the sample web app (dotnet new web)
+            command: dotnet new web -n HelloApp
+            args:
+              chdir: /home/aspnetapp/src
+              creates: /home/aspnetapp/src/HelloApp/HelloApp.csproj
+            become: true
+            become_user: aspnetapp
+            environment:
+              HOME: /home/aspnetapp
+              DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+              DOTNET_NOLOGO: "1"
+
+          - name: Publish the sample app to /home/aspnetapp/app
+            command: dotnet publish -c Release -o /home/aspnetapp/app
+            args:
+              chdir: /home/aspnetapp/src/HelloApp
+              creates: /home/aspnetapp/app/HelloApp.dll
+            become: true
+            become_user: aspnetapp
+            environment:
+              HOME: /home/aspnetapp
+              DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+              DOTNET_NOLOGO: "1"
+
+          - name: Show systemd unit stage
+            debug:
+              msg: "Writing systemd unit; Kestrel pinned to 127.0.0.1:5000 so nginx can reach it"
+
+          - name: Write the aspnetapp systemd unit (Kestrel on 127.0.0.1:5000)
+            copy:
+              dest: /etc/systemd/system/aspnetapp.service
+              mode: '0644'
+              content: |
+                [Unit]
+                Description=ASP.NET Core sample app
+                After=network.target
+
+                [Service]
+                WorkingDirectory=/home/aspnetapp/app
+                ExecStart=/usr/bin/dotnet /home/aspnetapp/app/HelloApp.dll
+                Restart=on-failure
+                RestartSec=5
+                User=aspnetapp
+                Group=aspnetapp
+                Environment=ASPNETCORE_URLS=http://127.0.0.1:5000
+                Environment=DOTNET_CLI_TELEMETRY_OPTOUT=1
+                Environment=DOTNET_NOLOGO=1
+
+                [Install]
+                WantedBy=multi-user.target
+
+          - name: Reload systemd to pick up the new unit
+            systemd:
+              daemon_reload: yes
+
+          - name: Enable and start the aspnetapp service
+            systemd:
+              name: aspnetapp
+              enabled: yes
+              state: started
+
+          - name: Show nginx stage
+            debug:
+              msg: "Configuring nginx reverse proxy to Kestrel on 127.0.0.1:5000"
+
+          - name: Write nginx reverse-proxy vhost
+            copy:
+              dest: /etc/nginx/sites-available/aspnetapp.conf
+              mode: '0644'
+              content: |
+                server {
+                    listen 80 default_server;
+                    listen [::]:80 default_server;
+                    server_name _;
+
+                    location / {
+                        proxy_pass http://127.0.0.1:5000;
+                        proxy_http_version 1.1;
+                        proxy_set_header Upgrade $http_upgrade;
+                        proxy_set_header Connection keep-alive;
+                        proxy_set_header Host $host;
+                        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto $scheme;
+                    }
+                }
+
+          - name: Enable the aspnetapp nginx site
+            file:
+              src: /etc/nginx/sites-available/aspnetapp.conf
+              dest: /etc/nginx/sites-enabled/aspnetapp.conf
+              state: link
+
+          - name: Remove the default nginx site so aspnetapp is the default_server
+            file:
+              path: /etc/nginx/sites-enabled/default
+              state: absent
+
+          - name: Validate nginx configuration
+            command: nginx -t
+            changed_when: false
+
+          - name: Restart nginx to apply the reverse-proxy configuration
+            service:
+              name: nginx
+              state: restarted
+              enabled: yes
+
+          - name: Write credentials/info file
+            copy:
+              dest: /home/ubuntu/credentials.txt
+              owner: ubuntu
+              group: ubuntu
+              mode: '0600'
+              content: |
+                ASP.NET Core (.NET 10 LTS) deployment
+                Site:            http://<server-ip>/   (port 80/tcp open)
+                App service:     systemd unit 'aspnetapp' (Kestrel on 127.0.0.1:5000, localhost-only)
+                Reverse proxy:   nginx on port 80 -> 127.0.0.1:5000
+                App files:       /home/aspnetapp/app  (published output, HelloApp.dll)
+                Source:          /home/aspnetapp/src/HelloApp
+                Runs as user:    aspnetapp (non-root)
+
+                To deploy your own app:
+                  publish your build over /home/aspnetapp/app, then:
+                  systemctl restart aspnetapp
+
+                No functional secrets are used by this stack.
+          # ----- END app-specific tasks -----
+
+          - name: Creating /opt/cloudstack directory
+            ansible.builtin.file:
+              path: /opt/cloudstack
+              state: directory
+
+          - name: Copy cleanup + update helper scripts
+            copy:
+              src: "{{ item.confsrc }}"
+              dest: "{{ item.confdest }}"
+            with_items:
+              - { confsrc: '/usr/local/src/aspnet-24-04/opt/cloudstack/aspnet-24-04_cleanup.sh', confdest: '/opt/cloudstack/'}
+              - { confsrc: '/usr/local/src/aspnet-24-04/opt/cloudstack/aspnet-24-04_update.sh', confdest: '/opt/cloudstack/'}
+
+          - name: Wire cleanup script to run on first login
+            lineinfile:
+              path: /root/.bashrc
+              line: "chmod +x /opt/cloudstack/aspnet-24-04_cleanup.sh && /opt/cloudstack/aspnet-24-04_cleanup.sh"
+              state: present
+        always:
+          - name: Restarting sshd
+            shell: "sed -i 's/ForceCommand echo Please wait until the installation is completed..../#Match User anoncvs/g' /etc/ssh/sshd_config && (systemctl restart ssh 2>/dev/null || systemctl restart sshd)"
